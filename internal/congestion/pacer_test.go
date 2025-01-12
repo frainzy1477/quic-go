@@ -1,11 +1,12 @@
 package congestion
 
 import (
+	"math/rand"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/protocol"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -100,6 +101,17 @@ var _ = Describe("Pacer", func() {
 		Expect(p.Budget(t.Add(5 * t2.Sub(t)))).To(BeEquivalentTo(5 * packetSize))
 	})
 
+	It("has enough budget for at least one packet when the timer expires", func() {
+		t := time.Now()
+		sendBurst(t)
+		for bw := uint64(100); bw < uint64(5*initialMaxDatagramSize); bw++ {
+			bandwidth = bw // reduce the bandwidth to 5 packet per second
+			t2 := p.TimeUntilSend()
+			Expect(t2).To(BeTemporally(">", t))
+			Expect(p.Budget(t2)).To(BeNumerically(">=", initialMaxDatagramSize))
+		}
+	})
+
 	It("never allows bursts larger than the maximum burst size", func() {
 		t := time.Now()
 		sendBurst(t)
@@ -127,5 +139,14 @@ var _ = Describe("Pacer", func() {
 		bandwidth = uint64(1e6 * initialMaxDatagramSize)
 		Expect(p.TimeUntilSend()).To(Equal(t.Add(protocol.MinPacingDelay)))
 		Expect(p.Budget(t.Add(protocol.MinPacingDelay))).To(Equal(protocol.ByteCount(protocol.MinPacingDelay) * initialMaxDatagramSize * 1e6 / 1e9))
+	})
+
+	It("protects against overflows", func() {
+		p = newPacer(func() Bandwidth { return infBandwidth })
+		t := time.Now()
+		p.SentPacket(t, initialMaxDatagramSize)
+		for i := 0; i < 1e5; i++ {
+			Expect(p.Budget(t.Add(time.Duration(rand.Int63())))).To(BeNumerically(">=", 0))
+		}
 	})
 })

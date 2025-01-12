@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"strconv"
 
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
 
@@ -29,11 +29,11 @@ var _ = Describe("error codes", func() {
 			valString := c.(*ast.ValueSpec).Values[0].(*ast.BasicLit).Value
 			val, err := strconv.ParseInt(valString, 0, 64)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(errorCode(val).String()).ToNot(Equal("unknown error code"))
+			Expect(ErrCode(val).String()).ToNot(Equal("unknown error code"))
 		}
 	})
 
 	It("has a string representation for unknown error codes", func() {
-		Expect(errorCode(0x1337).String()).To(Equal("unknown error code: 0x1337"))
+		Expect(ErrCode(0x1337).String()).To(Equal("unknown error code: 0x1337"))
 	})
 })
