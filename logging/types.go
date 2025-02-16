@@ -63,19 +63,21 @@ type TimerType uint8
 
 const (
 	// TimerTypeACK is the timer type for the early retransmit timer
-	TimerTypeACK TimerType = iota
+	TimerTypeACK TimerType = iota + 1
 	// TimerTypePTO is the timer type for the PTO retransmit timer
 	TimerTypePTO
+	// TimerTypePathProbe is the timer type for the path probe retransmit timer
+	TimerTypePathProbe
 )
 
-// TimeoutReason is the reason why a session is closed
+// TimeoutReason is the reason why a connection is closed
 type TimeoutReason uint8
 
 const (
-	// TimeoutReasonHandshake is used when the session is closed due to a handshake timeout
+	// TimeoutReasonHandshake is used when the connection is closed due to a handshake timeout
 	// This reason is not defined in the qlog draft, but very useful for debugging.
 	TimeoutReasonHandshake TimeoutReason = iota
-	// TimeoutReasonIdle is used when the session is closed due to an idle timeout
+	// TimeoutReasonIdle is used when the connection is closed due to an idle timeout
 	// This reason is not defined in the qlog draft, but very useful for debugging.
 	TimeoutReasonIdle
 )
@@ -87,8 +89,42 @@ const (
 	CongestionStateSlowStart CongestionState = iota
 	// CongestionStateCongestionAvoidance is the slow start phase of Reno / Cubic
 	CongestionStateCongestionAvoidance
-	// CongestionStateCongestionAvoidance is the recovery phase of Reno / Cubic
+	// CongestionStateRecovery is the recovery phase of Reno / Cubic
 	CongestionStateRecovery
 	// CongestionStateApplicationLimited means that the congestion controller is application limited
 	CongestionStateApplicationLimited
+)
+
+// ECNState is the state of the ECN state machine (see Appendix A.4 of RFC 9000)
+type ECNState uint8
+
+const (
+	// ECNStateTesting is the testing state
+	ECNStateTesting ECNState = 1 + iota
+	// ECNStateUnknown is the unknown state
+	ECNStateUnknown
+	// ECNStateFailed is the failed state
+	ECNStateFailed
+	// ECNStateCapable is the capable state
+	ECNStateCapable
+)
+
+// ECNStateTrigger is a trigger for an ECN state transition.
+type ECNStateTrigger uint8
+
+const (
+	ECNTriggerNoTrigger ECNStateTrigger = iota
+	// ECNFailedNoECNCounts is emitted when an ACK acknowledges ECN-marked packets,
+	// but doesn't contain any ECN counts
+	ECNFailedNoECNCounts
+	// ECNFailedDecreasedECNCounts is emitted when an ACK frame decreases ECN counts
+	ECNFailedDecreasedECNCounts
+	// ECNFailedLostAllTestingPackets is emitted when all ECN testing packets are declared lost
+	ECNFailedLostAllTestingPackets
+	// ECNFailedMoreECNCountsThanSent is emitted when an ACK contains more ECN counts than ECN-marked packets were sent
+	ECNFailedMoreECNCountsThanSent
+	// ECNFailedTooFewECNCounts is emitted when an ACK contains fewer ECN counts than it acknowledges packets
+	ECNFailedTooFewECNCounts
+	// ECNFailedManglingDetected is emitted when the path marks all ECN-marked packets as CE
+	ECNFailedManglingDetected
 )

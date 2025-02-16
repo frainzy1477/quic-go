@@ -3,22 +3,21 @@
 package logging
 
 import (
-	"context"
-	"net"
-	"time"
-
-	"github.com/lucas-clemente/quic-go/internal/utils"
-
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/wire"
 )
 
 type (
 	// A ByteCount is used to count bytes.
 	ByteCount = protocol.ByteCount
+	// ECN is the ECN value
+	ECN = protocol.ECN
 	// A ConnectionID is a QUIC Connection ID.
 	ConnectionID = protocol.ConnectionID
+	// An ArbitraryLenConnectionID is a QUIC Connection ID that can be up to 255 bytes long.
+	ArbitraryLenConnectionID = protocol.ArbitraryLenConnectionID
 	// The EncryptionLevel is the encryption level of a packet.
 	EncryptionLevel = protocol.EncryptionLevel
 	// The KeyPhase is the key phase of the 1-RTT keys.
@@ -37,12 +36,12 @@ type (
 	StreamNum = protocol.StreamNum
 	// The StreamType is the type of the stream (unidirectional or bidirectional).
 	StreamType = protocol.StreamType
-	// The VersionNumber is the QUIC version.
-	VersionNumber = protocol.VersionNumber
+	// The Version is the QUIC version.
+	Version = protocol.Version
 
 	// The Header is the QUIC packet header, before removing header protection.
 	Header = wire.Header
-	// The ExtendedHeader is the QUIC packet header, after removing header protection.
+	// The ExtendedHeader is the QUIC Long Header packet header, after removing header protection.
 	ExtendedHeader = wire.ExtendedHeader
 	// The TransportParameters are QUIC transport parameters.
 	TransportParameters = wire.TransportParameters
@@ -59,28 +58,41 @@ type (
 )
 
 const (
+	// ECNUnsupported means that no ECN value was set / received
+	ECNUnsupported = protocol.ECNUnsupported
+	// ECTNot is Not-ECT
+	ECTNot = protocol.ECNNon
+	// ECT0 is ECT(0)
+	ECT0 = protocol.ECT0
+	// ECT1 is ECT(1)
+	ECT1 = protocol.ECT1
+	// ECNCE is CE
+	ECNCE = protocol.ECNCE
+)
+
+const (
 	// KeyPhaseZero is key phase bit 0
-	KeyPhaseZero KeyPhaseBit = protocol.KeyPhaseZero
+	KeyPhaseZero = protocol.KeyPhaseZero
 	// KeyPhaseOne is key phase bit 1
-	KeyPhaseOne KeyPhaseBit = protocol.KeyPhaseOne
+	KeyPhaseOne = protocol.KeyPhaseOne
 )
 
 const (
 	// PerspectiveServer is used for a QUIC server
-	PerspectiveServer Perspective = protocol.PerspectiveServer
+	PerspectiveServer = protocol.PerspectiveServer
 	// PerspectiveClient is used for a QUIC client
-	PerspectiveClient Perspective = protocol.PerspectiveClient
+	PerspectiveClient = protocol.PerspectiveClient
 )
 
 const (
 	// EncryptionInitial is the Initial encryption level
-	EncryptionInitial EncryptionLevel = protocol.EncryptionInitial
+	EncryptionInitial = protocol.EncryptionInitial
 	// EncryptionHandshake is the Handshake encryption level
-	EncryptionHandshake EncryptionLevel = protocol.EncryptionHandshake
+	EncryptionHandshake = protocol.EncryptionHandshake
 	// Encryption1RTT is the 1-RTT encryption level
-	Encryption1RTT EncryptionLevel = protocol.Encryption1RTT
+	Encryption1RTT = protocol.Encryption1RTT
 	// Encryption0RTT is the 0-RTT encryption level
-	Encryption0RTT EncryptionLevel = protocol.Encryption0RTT
+	Encryption0RTT = protocol.Encryption0RTT
 )
 
 const (
@@ -90,45 +102,10 @@ const (
 	StreamTypeBidi = protocol.StreamTypeBidi
 )
 
-// A Tracer traces events.
-type Tracer interface {
-	// TracerForConnection requests a new tracer for a connection.
-	// The ODCID is the original destination connection ID:
-	// The destination connection ID that the client used on the first Initial packet it sent on this connection.
-	// If nil is returned, tracing will be disabled for this connection.
-	TracerForConnection(ctx context.Context, p Perspective, odcid ConnectionID) ConnectionTracer
-
-	SentPacket(net.Addr, *Header, ByteCount, []Frame)
-	DroppedPacket(net.Addr, PacketType, ByteCount, PacketDropReason)
-}
-
-// A ConnectionTracer records events.
-type ConnectionTracer interface {
-	StartedConnection(local, remote net.Addr, srcConnID, destConnID ConnectionID)
-	NegotiatedVersion(chosen VersionNumber, clientVersions, serverVersions []VersionNumber)
-	ClosedConnection(error)
-	SentTransportParameters(*TransportParameters)
-	ReceivedTransportParameters(*TransportParameters)
-	RestoredTransportParameters(parameters *TransportParameters) // for 0-RTT
-	SentPacket(hdr *ExtendedHeader, size ByteCount, ack *AckFrame, frames []Frame)
-	ReceivedVersionNegotiationPacket(*Header, []VersionNumber)
-	ReceivedRetry(*Header)
-	ReceivedPacket(hdr *ExtendedHeader, size ByteCount, frames []Frame)
-	BufferedPacket(PacketType)
-	DroppedPacket(PacketType, ByteCount, PacketDropReason)
-	UpdatedMetrics(rttStats *RTTStats, cwnd, bytesInFlight ByteCount, packetsInFlight int)
-	AcknowledgedPacket(EncryptionLevel, PacketNumber)
-	LostPacket(EncryptionLevel, PacketNumber, PacketLossReason)
-	UpdatedCongestionState(CongestionState)
-	UpdatedPTOCount(value uint32)
-	UpdatedKeyFromTLS(EncryptionLevel, Perspective)
-	UpdatedKey(generation KeyPhase, remote bool)
-	DroppedEncryptionLevel(EncryptionLevel)
-	DroppedKey(generation KeyPhase)
-	SetLossTimer(TimerType, EncryptionLevel, time.Time)
-	LossTimerExpired(TimerType, EncryptionLevel)
-	LossTimerCanceled()
-	// Close is called when the connection is closed.
-	Close()
-	Debug(name, msg string)
+// The ShortHeader is the QUIC Short Header packet header, after removing header protection.
+type ShortHeader struct {
+	DestConnectionID ConnectionID
+	PacketNumber     PacketNumber
+	PacketNumberLen  protocol.PacketNumberLen
+	KeyPhase         KeyPhaseBit
 }
