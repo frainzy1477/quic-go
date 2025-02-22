@@ -1,29 +1,24 @@
 package main
 
 import (
-	"bufio"
 	"crypto/md5"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"mime/multipart"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 
 	_ "net/http/pprof"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/http3"
-	"github.com/lucas-clemente/quic-go/internal/testdata"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/logging"
-	"github.com/lucas-clemente/quic-go/qlog"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/internal/testdata"
+	"github.com/quic-go/quic-go/qlog"
 )
 
 type binds []string
@@ -93,7 +88,7 @@ func setupHandler(www string) http.Handler {
 	})
 
 	mux.HandleFunc("/demo/echo", func(w http.ResponseWriter, r *http.Request) {
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			fmt.Printf("error reading body while handling /echo: %s\n", err.Error())
 		}
@@ -121,7 +116,7 @@ func setupHandler(www string) http.Handler {
 					err = errors.New("couldn't get uploaded file size")
 				}
 			}
-			utils.DefaultLogger.Infof("Error receiving upload: %#v", err)
+			log.Printf("Error receiving upload: %#v", err)
 		}
 		io.WriteString(w, `<html><body><form action="/demo/upload" method="post" enctype="multipart/form-data">
 				<input type="file" name="uploadfile"><br>
@@ -139,56 +134,45 @@ func main() {
 	}()
 	// runtime.SetBlockProfileRate(1)
 
-	verbose := flag.Bool("v", false, "verbose")
 	bs := binds{}
 	flag.Var(&bs, "bind", "bind to")
 	www := flag.String("www", "", "www data")
 	tcp := flag.Bool("tcp", false, "also listen on TCP")
-	enableQlog := flag.Bool("qlog", false, "output a qlog (in the same directory)")
+	key := flag.String("key", "", "TLS key (requires -cert option)")
+	cert := flag.String("cert", "", "TLS certificate (requires -key option)")
 	flag.Parse()
-
-	logger := utils.DefaultLogger
-
-	if *verbose {
-		logger.SetLogLevel(utils.LogLevelDebug)
-	} else {
-		logger.SetLogLevel(utils.LogLevelInfo)
-	}
-	logger.SetLogTimeFormat("")
 
 	if len(bs) == 0 {
 		bs = binds{"localhost:6121"}
 	}
 
 	handler := setupHandler(*www)
-	quicConf := &quic.Config{}
-	if *enableQlog {
-		quicConf.Tracer = qlog.NewTracer(func(_ logging.Perspective, connID []byte) io.WriteCloser {
-			filename := fmt.Sprintf("server_%x.qlog", connID)
-			f, err := os.Create(filename)
-			if err != nil {
-				log.Fatal(err)
-			}
-			log.Printf("Creating qlog file %s.\n", filename)
-			return utils.NewBufferedWriteCloser(bufio.NewWriter(f), f)
-		})
-	}
 
 	var wg sync.WaitGroup
 	wg.Add(len(bs))
+	var certFile, keyFile string
+	if *key != "" && *cert != "" {
+		keyFile = *key
+		certFile = *cert
+	} else {
+		certFile, keyFile = testdata.GetCertificatePaths()
+	}
 	for _, b := range bs {
+		fmt.Println("listening on", b)
 		bCap := b
 		go func() {
 			var err error
 			if *tcp {
-				certFile, keyFile := testdata.GetCertificatePaths()
-				err = http3.ListenAndServe(bCap, certFile, keyFile, handler)
+				err = http3.ListenAndServeTLS(bCap, certFile, keyFile, handler)
 			} else {
 				server := http3.Server{
-					Server:     &http.Server{Handler: handler, Addr: bCap},
-					QuicConfig: quicConf,
+					Handler: handler,
+					Addr:    bCap,
+					QUICConfig: &quic.Config{
+						Tracer: qlog.DefaultConnectionTracer,
+					},
 				}
-				err = server.ListenAndServeTLS(testdata.GetCertificatePaths())
+				err = server.ListenAndServeTLS(certFile, keyFile)
 			}
 			if err != nil {
 				fmt.Println(err)

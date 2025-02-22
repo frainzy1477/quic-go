@@ -3,9 +3,9 @@ package qlog
 import (
 	"fmt"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/qerr"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/logging"
 )
 
 type owner uint8
@@ -39,12 +39,6 @@ func (s streamType) String() string {
 	}
 }
 
-type connectionID protocol.ConnectionID
-
-func (c connectionID) String() string {
-	return fmt.Sprintf("%x", []byte(c))
-}
-
 // category is the qlog event category.
 type category uint8
 
@@ -70,9 +64,9 @@ func (c category) String() string {
 	}
 }
 
-type versionNumber protocol.VersionNumber
+type version protocol.Version
 
-func (v versionNumber) String() string {
+func (v version) String() string {
 	return fmt.Sprintf("%x", uint32(v))
 }
 
@@ -297,6 +291,8 @@ func (t timerType) String() string {
 		return "ack"
 	case logging.TimerTypePTO:
 		return "pto"
+	case logging.TimerTypePathProbe:
+		return "path_probe"
 	default:
 		return "unknown timer type"
 	}
@@ -316,5 +312,63 @@ func (s congestionState) String() string {
 		return "application_limited"
 	default:
 		return "unknown congestion state"
+	}
+}
+
+type ecn logging.ECN
+
+func (e ecn) String() string {
+	//nolint:exhaustive // The unsupported value is never logged.
+	switch logging.ECN(e) {
+	case logging.ECTNot:
+		return "Not-ECT"
+	case logging.ECT0:
+		return "ECT(0)"
+	case logging.ECT1:
+		return "ECT(1)"
+	case logging.ECNCE:
+		return "CE"
+	default:
+		return "unknown ECN"
+	}
+}
+
+type ecnState logging.ECNState
+
+func (e ecnState) String() string {
+	switch logging.ECNState(e) {
+	case logging.ECNStateTesting:
+		return "testing"
+	case logging.ECNStateUnknown:
+		return "unknown"
+	case logging.ECNStateCapable:
+		return "capable"
+	case logging.ECNStateFailed:
+		return "failed"
+	default:
+		return "unknown ECN state"
+	}
+}
+
+type ecnStateTrigger logging.ECNStateTrigger
+
+func (e ecnStateTrigger) String() string {
+	switch logging.ECNStateTrigger(e) {
+	case logging.ECNTriggerNoTrigger:
+		return ""
+	case logging.ECNFailedNoECNCounts:
+		return "ACK doesn't contain ECN marks"
+	case logging.ECNFailedDecreasedECNCounts:
+		return "ACK decreases ECN counts"
+	case logging.ECNFailedLostAllTestingPackets:
+		return "all ECN testing packets declared lost"
+	case logging.ECNFailedMoreECNCountsThanSent:
+		return "ACK contains more ECN counts than ECN-marked packets sent"
+	case logging.ECNFailedTooFewECNCounts:
+		return "ACK contains fewer new ECN counts than acknowledged ECN-marked packets"
+	case logging.ECNFailedManglingDetected:
+		return "ECN mangling detected"
+	default:
+		return "unknown ECN state trigger"
 	}
 }

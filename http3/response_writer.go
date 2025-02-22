@@ -1,51 +1,72 @@
 package http3
 
 import (
-	"bufio"
 	"bytes"
+	"fmt"
+	"log/slog"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
+	"time"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/marten-seemann/qpack"
+	"github.com/quic-go/qpack"
+	"golang.org/x/net/http/httpguts"
 )
 
-// DataStreamer lets the caller take over the stream. After a call to DataStream
-// the HTTP server library will not do anything else with the connection.
-//
-// It becomes the caller's responsibility to manage and close the stream.
-//
-// After a call to DataStream, the original Request.Body must not be used.
-type DataStreamer interface {
-	DataStream() quic.Stream
+// The HTTPStreamer allows taking over a HTTP/3 stream. The interface is implemented the http.Response.Body.
+// On the client side, the stream will be closed for writing, unless the DontCloseRequestStream RoundTripOpt was set.
+// When a stream is taken over, it's the caller's responsibility to close the stream.
+type HTTPStreamer interface {
+	HTTPStream() Stream
 }
 
+// The maximum length of an encoded HTTP/3 frame header is 16:
+// The frame has a type and length field, both QUIC varints (maximum 8 bytes in length)
+const frameHeaderLen = 16
+
+const maxSmallResponseSize = 4096
+
 type responseWriter struct {
-	stream         quic.Stream // needed for DataStream()
-	bufferedStream *bufio.Writer
+	str *stream
 
-	header         http.Header
-	status         int // status code passed to WriteHeader
-	headerWritten  bool
-	dataStreamUsed bool // set when DataSteam() is called
+	conn     Connection
+	header   http.Header
+	trailers map[string]struct{}
+	buf      []byte
+	status   int // status code passed to WriteHeader
 
-	logger utils.Logger
+	// for responses smaller than maxSmallResponseSize, we buffer calls to Write,
+	// and automatically add the Content-Length header
+	smallResponseBuf []byte
+
+	contentLen     int64 // if handler set valid Content-Length header
+	numWritten     int64 // bytes written
+	headerComplete bool  // set once WriteHeader is called with a status code >= 200
+	headerWritten  bool  // set once the response header has been serialized to the stream
+	isHead         bool
+	trailerWritten bool // set once the response trailers has been serialized to the stream
+
+	hijacked bool // set on HTTPStream is called
+
+	logger *slog.Logger
 }
 
 var (
 	_ http.ResponseWriter = &responseWriter{}
 	_ http.Flusher        = &responseWriter{}
-	_ DataStreamer        = &responseWriter{}
+	_ Hijacker            = &responseWriter{}
+	_ HTTPStreamer        = &responseWriter{}
 )
 
-func newResponseWriter(stream quic.Stream, logger utils.Logger) *responseWriter {
+func newResponseWriter(str *stream, conn Connection, isHead bool, logger *slog.Logger) *responseWriter {
 	return &responseWriter{
-		header:         http.Header{},
-		stream:         stream,
-		bufferedStream: bufio.NewWriter(stream),
-		logger:         logger,
+		str:    str,
+		conn:   conn,
+		header: http.Header{},
+		buf:    make([]byte, frameHeaderLen),
+		isHead: isHead,
+		logger: logger,
 	}
 }
 
@@ -54,69 +75,274 @@ func (w *responseWriter) Header() http.Header {
 }
 
 func (w *responseWriter) WriteHeader(status int) {
-	if w.headerWritten {
+	if w.headerComplete {
 		return
 	}
 
-	if status < 100 || status >= 200 {
-		w.headerWritten = true
+	// http status must be 3 digits
+	if status < 100 || status > 999 {
+		panic(fmt.Sprintf("invalid WriteHeader code %v", status))
 	}
 	w.status = status
 
-	var headers bytes.Buffer
-	enc := qpack.NewEncoder(&headers)
-	enc.WriteField(qpack.HeaderField{Name: ":status", Value: strconv.Itoa(status)})
+	// immediately write 1xx headers
+	if status < 200 {
+		w.writeHeader(status)
+		return
+	}
 
-	for k, v := range w.header {
-		for index := range v {
-			enc.WriteField(qpack.HeaderField{Name: strings.ToLower(k), Value: v[index]})
+	// We're done with headers once we write a status >= 200.
+	w.headerComplete = true
+	// Add Date header.
+	// This is what the standard library does.
+	// Can be disabled by setting the Date header to nil.
+	if _, ok := w.header["Date"]; !ok {
+		w.header.Set("Date", time.Now().UTC().Format(http.TimeFormat))
+	}
+	// Content-Length checking
+	// use ParseUint instead of ParseInt, as negative values are invalid
+	if clen := w.header.Get("Content-Length"); clen != "" {
+		if cl, err := strconv.ParseUint(clen, 10, 63); err == nil {
+			w.contentLen = int64(cl)
+		} else {
+			// emit a warning for malformed Content-Length and remove it
+			logger := w.logger
+			if logger == nil {
+				logger = slog.Default()
+			}
+			logger.Error("Malformed Content-Length", "value", clen)
+			w.header.Del("Content-Length")
 		}
 	}
+}
 
-	buf := &bytes.Buffer{}
-	(&headersFrame{Length: uint64(headers.Len())}).Write(buf)
-	w.logger.Infof("Responding with %d", status)
-	if _, err := w.bufferedStream.Write(buf.Bytes()); err != nil {
-		w.logger.Errorf("could not write headers frame: %s", err.Error())
-	}
-	if _, err := w.bufferedStream.Write(headers.Bytes()); err != nil {
-		w.logger.Errorf("could not write header frame payload: %s", err.Error())
-	}
-	if !w.headerWritten {
-		w.Flush()
+func (w *responseWriter) sniffContentType(p []byte) {
+	// If no content type, apply sniffing algorithm to body.
+	// We can't use `w.header.Get` here since if the Content-Type was set to nil, we shouldn't do sniffing.
+	_, haveType := w.header["Content-Type"]
+
+	// If the Content-Encoding was set and is non-blank, we shouldn't sniff the body.
+	hasCE := w.header.Get("Content-Encoding") != ""
+	if !hasCE && !haveType && len(p) > 0 {
+		w.header.Set("Content-Type", http.DetectContentType(p))
 	}
 }
 
 func (w *responseWriter) Write(p []byte) (int, error) {
-	if !w.headerWritten {
-		w.WriteHeader(200)
+	bodyAllowed := bodyAllowedForStatus(w.status)
+	if !w.headerComplete {
+		w.sniffContentType(p)
+		w.WriteHeader(http.StatusOK)
+		bodyAllowed = true
 	}
-	if !bodyAllowedForStatus(w.status) {
+	if !bodyAllowed {
 		return 0, http.ErrBodyNotAllowed
 	}
-	df := &dataFrame{Length: uint64(len(p))}
-	buf := &bytes.Buffer{}
-	df.Write(buf)
-	if _, err := w.bufferedStream.Write(buf.Bytes()); err != nil {
-		return 0, err
+
+	w.numWritten += int64(len(p))
+	if w.contentLen != 0 && w.numWritten > w.contentLen {
+		return 0, http.ErrContentLength
 	}
-	return w.bufferedStream.Write(p)
+
+	if w.isHead {
+		return len(p), nil
+	}
+
+	if !w.headerWritten {
+		// Buffer small responses.
+		// This allows us to automatically set the Content-Length field.
+		if len(w.smallResponseBuf)+len(p) < maxSmallResponseSize {
+			w.smallResponseBuf = append(w.smallResponseBuf, p...)
+			return len(p), nil
+		}
+	}
+	return w.doWrite(p)
+}
+
+func (w *responseWriter) doWrite(p []byte) (int, error) {
+	if !w.headerWritten {
+		w.sniffContentType(w.smallResponseBuf)
+		if err := w.writeHeader(w.status); err != nil {
+			return 0, maybeReplaceError(err)
+		}
+		w.headerWritten = true
+	}
+
+	l := uint64(len(w.smallResponseBuf) + len(p))
+	if l == 0 {
+		return 0, nil
+	}
+	df := &dataFrame{Length: l}
+	w.buf = w.buf[:0]
+	w.buf = df.Append(w.buf)
+	if _, err := w.str.writeUnframed(w.buf); err != nil {
+		return 0, maybeReplaceError(err)
+	}
+	if len(w.smallResponseBuf) > 0 {
+		if _, err := w.str.writeUnframed(w.smallResponseBuf); err != nil {
+			return 0, maybeReplaceError(err)
+		}
+		w.smallResponseBuf = nil
+	}
+	var n int
+	if len(p) > 0 {
+		var err error
+		n, err = w.str.writeUnframed(p)
+		if err != nil {
+			return n, maybeReplaceError(err)
+		}
+	}
+	return n, nil
+}
+
+func (w *responseWriter) writeHeader(status int) error {
+	var headers bytes.Buffer
+	enc := qpack.NewEncoder(&headers)
+	if err := enc.WriteField(qpack.HeaderField{Name: ":status", Value: strconv.Itoa(status)}); err != nil {
+		return err
+	}
+
+	// Handle trailer fields
+	if vals, ok := w.header["Trailer"]; ok {
+		for _, val := range vals {
+			for _, trailer := range strings.Split(val, ",") {
+				// We need to convert to the canonical header key value here because this will be called when using
+				// headers.Add or headers.Set.
+				trailer = textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(trailer))
+				w.declareTrailer(trailer)
+			}
+		}
+	}
+
+	for k, v := range w.header {
+		if _, excluded := w.trailers[k]; excluded {
+			continue
+		}
+		// Ignore "Trailer:" prefixed headers
+		if strings.HasPrefix(k, http.TrailerPrefix) {
+			continue
+		}
+		for index := range v {
+			if err := enc.WriteField(qpack.HeaderField{Name: strings.ToLower(k), Value: v[index]}); err != nil {
+				return err
+			}
+		}
+	}
+
+	buf := make([]byte, 0, frameHeaderLen+headers.Len())
+	buf = (&headersFrame{Length: uint64(headers.Len())}).Append(buf)
+	buf = append(buf, headers.Bytes()...)
+
+	_, err := w.str.writeUnframed(buf)
+	return err
+}
+
+func (w *responseWriter) FlushError() error {
+	if !w.headerComplete {
+		w.WriteHeader(http.StatusOK)
+	}
+	_, err := w.doWrite(nil)
+	return err
+}
+
+func (w *responseWriter) flushTrailers() {
+	if w.trailerWritten {
+		return
+	}
+	if err := w.writeTrailers(); err != nil {
+		w.logger.Debug("could not write trailers", "error", err)
+	}
 }
 
 func (w *responseWriter) Flush() {
-	if err := w.bufferedStream.Flush(); err != nil {
-		w.logger.Errorf("could not flush to stream: %s", err.Error())
+	if err := w.FlushError(); err != nil {
+		if w.logger != nil {
+			w.logger.Debug("could not flush to stream", "error", err)
+		}
 	}
 }
 
-func (w *responseWriter) usedDataStream() bool {
-	return w.dataStreamUsed
+// declareTrailer adds a trailer to the trailer list, while also validating that the trailer has a
+// valid name.
+func (w *responseWriter) declareTrailer(k string) {
+	if !httpguts.ValidTrailerHeader(k) {
+		// Forbidden by RFC 9110, section 6.5.1.
+		w.logger.Debug("ignoring invalid trailer", slog.String("header", k))
+		return
+	}
+	if w.trailers == nil {
+		w.trailers = make(map[string]struct{})
+	}
+	w.trailers[k] = struct{}{}
 }
 
-func (w *responseWriter) DataStream() quic.Stream {
-	w.dataStreamUsed = true
+// hasNonEmptyTrailers checks to see if there are any trailers with an actual
+// value set. This is possible by adding trailers to the "Trailers" header
+// but never actually setting those names as trailers in the course of handling
+// the request. In that case, this check may save us some allocations.
+func (w *responseWriter) hasNonEmptyTrailers() bool {
+	for trailer := range w.trailers {
+		if _, ok := w.header[trailer]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// writeTrailers will write trailers to the stream if there are any.
+func (w *responseWriter) writeTrailers() error {
+	// promote headers added via "Trailer:" convention as trailers, these can be added after
+	// streaming the status/headers have been written.
+	for k := range w.header {
+		// Handle "Trailer:" prefix
+		if strings.HasPrefix(k, http.TrailerPrefix) {
+			w.declareTrailer(k)
+		}
+	}
+
+	if !w.hasNonEmptyTrailers() {
+		return nil
+	}
+
+	var b bytes.Buffer
+	enc := qpack.NewEncoder(&b)
+	for trailer := range w.trailers {
+		trailerName := strings.ToLower(strings.TrimPrefix(trailer, http.TrailerPrefix))
+		if vals, ok := w.header[trailer]; ok {
+			for _, val := range vals {
+				if err := enc.WriteField(qpack.HeaderField{Name: trailerName, Value: val}); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	buf := make([]byte, 0, frameHeaderLen+b.Len())
+	buf = (&headersFrame{Length: uint64(b.Len())}).Append(buf)
+	buf = append(buf, b.Bytes()...)
+	_, err := w.str.writeUnframed(buf)
+	w.trailerWritten = true
+	return err
+}
+
+func (w *responseWriter) HTTPStream() Stream {
+	w.hijacked = true
 	w.Flush()
-	return w.stream
+	return w.str
+}
+
+func (w *responseWriter) wasStreamHijacked() bool { return w.hijacked }
+
+func (w *responseWriter) Connection() Connection {
+	return w.conn
+}
+
+func (w *responseWriter) SetReadDeadline(deadline time.Time) error {
+	return w.str.SetReadDeadline(deadline)
+}
+
+func (w *responseWriter) SetWriteDeadline(deadline time.Time) error {
+	return w.str.SetWriteDeadline(deadline)
 }
 
 // copied from http2/http2.go
@@ -126,9 +352,9 @@ func bodyAllowedForStatus(status int) bool {
 	switch {
 	case status >= 100 && status <= 199:
 		return false
-	case status == 204:
+	case status == http.StatusNoContent:
 		return false
-	case status == 304:
+	case status == http.StatusNotModified:
 		return false
 	}
 	return true
