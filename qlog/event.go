@@ -4,12 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/logging"
 
 	"github.com/francoispqt/gojay"
 )
@@ -36,7 +36,7 @@ func (e event) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.ObjectKey("data", e.eventDetails)
 }
 
-type versions []versionNumber
+type versions []version
 
 func (v versions) IsNil() bool { return false }
 func (v versions) MarshalJSONArray(enc *gojay.Encoder) {
@@ -71,7 +71,7 @@ func (e eventConnectionStarted) Name() string       { return "connection_started
 func (e eventConnectionStarted) IsNil() bool        { return false }
 
 func (e eventConnectionStarted) MarshalJSONObject(enc *gojay.Encoder) {
-	if utils.IsIPv4(e.SrcAddr.IP) {
+	if e.SrcAddr.IP.To4() != nil {
 		enc.StringKey("ip_version", "ipv4")
 	} else {
 		enc.StringKey("ip_version", "ipv6")
@@ -80,13 +80,13 @@ func (e eventConnectionStarted) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.IntKey("src_port", e.SrcAddr.Port)
 	enc.StringKey("dst_ip", e.DestAddr.IP.String())
 	enc.IntKey("dst_port", e.DestAddr.Port)
-	enc.StringKey("src_cid", connectionID(e.SrcConnectionID).String())
-	enc.StringKey("dst_cid", connectionID(e.DestConnectionID).String())
+	enc.StringKey("src_cid", e.SrcConnectionID.String())
+	enc.StringKey("dst_cid", e.DestConnectionID.String())
 }
 
 type eventVersionNegotiated struct {
-	clientVersions, serverVersions []versionNumber
-	chosenVersion                  versionNumber
+	clientVersions, serverVersions []version
+	chosenVersion                  version
 }
 
 func (e eventVersionNegotiated) Category() category { return categoryTransport }
@@ -124,7 +124,6 @@ func (e eventConnectionClosed) MarshalJSONObject(enc *gojay.Encoder) {
 	case errors.As(e.e, &statelessResetErr):
 		enc.StringKey("owner", ownerRemote.String())
 		enc.StringKey("trigger", "stateless_reset")
-		enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", statelessResetErr.Token))
 	case errors.As(e.e, &handshakeTimeoutErr):
 		enc.StringKey("owner", ownerLocal.String())
 		enc.StringKey("trigger", "handshake_timeout")
@@ -148,17 +147,17 @@ func (e eventConnectionClosed) MarshalJSONObject(enc *gojay.Encoder) {
 		enc.StringKey("connection_code", transportError(transportErr.ErrorCode).String())
 		enc.StringKey("reason", transportErr.ErrorMessage)
 	case errors.As(e.e, &versionNegotiationErr):
-		enc.StringKey("owner", ownerRemote.String())
-		enc.StringKey("trigger", "version_negotiation")
+		enc.StringKey("trigger", "version_mismatch")
 	}
 }
 
 type eventPacketSent struct {
-	Header        packetHeader
+	Header        gojay.MarshalerJSONObject // either a shortHeader or a packetHeader
 	Length        logging.ByteCount
 	PayloadLength logging.ByteCount
 	Frames        frames
 	IsCoalesced   bool
+	ECN           logging.ECN
 	Trigger       string
 }
 
@@ -173,14 +172,18 @@ func (e eventPacketSent) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.ObjectKey("raw", rawInfo{Length: e.Length, PayloadLength: e.PayloadLength})
 	enc.ArrayKeyOmitEmpty("frames", e.Frames)
 	enc.BoolKeyOmitEmpty("is_coalesced", e.IsCoalesced)
+	if e.ECN != logging.ECNUnsupported {
+		enc.StringKey("ecn", ecn(e.ECN).String())
+	}
 	enc.StringKeyOmitEmpty("trigger", e.Trigger)
 }
 
 type eventPacketReceived struct {
-	Header        packetHeader
+	Header        gojay.MarshalerJSONObject // either a shortHeader or a packetHeader
 	Length        logging.ByteCount
 	PayloadLength logging.ByteCount
 	Frames        frames
+	ECN           logging.ECN
 	IsCoalesced   bool
 	Trigger       string
 }
@@ -196,6 +199,9 @@ func (e eventPacketReceived) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.ObjectKey("raw", rawInfo{Length: e.Length, PayloadLength: e.PayloadLength})
 	enc.ArrayKeyOmitEmpty("frames", e.Frames)
 	enc.BoolKeyOmitEmpty("is_coalesced", e.IsCoalesced)
+	if e.ECN != logging.ECNUnsupported {
+		enc.StringKey("ecn", ecn(e.ECN).String())
+	}
 	enc.StringKeyOmitEmpty("trigger", e.Trigger)
 }
 
@@ -212,8 +218,8 @@ func (e eventRetryReceived) MarshalJSONObject(enc *gojay.Encoder) {
 }
 
 type eventVersionNegotiationReceived struct {
-	Header            packetHeader
-	SupportedVersions []versionNumber
+	Header            packetHeaderVersionNegotiation
+	SupportedVersions []version
 }
 
 func (e eventVersionNegotiationReceived) Category() category { return categoryTransport }
@@ -225,8 +231,23 @@ func (e eventVersionNegotiationReceived) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.ArrayKey("supported_versions", versions(e.SupportedVersions))
 }
 
+type eventVersionNegotiationSent struct {
+	Header            packetHeaderVersionNegotiation
+	SupportedVersions []version
+}
+
+func (e eventVersionNegotiationSent) Category() category { return categoryTransport }
+func (e eventVersionNegotiationSent) Name() string       { return "packet_sent" }
+func (e eventVersionNegotiationSent) IsNil() bool        { return false }
+
+func (e eventVersionNegotiationSent) MarshalJSONObject(enc *gojay.Encoder) {
+	enc.ObjectKey("header", e.Header)
+	enc.ArrayKey("supported_versions", versions(e.SupportedVersions))
+}
+
 type eventPacketBuffered struct {
 	PacketType logging.PacketType
+	PacketSize protocol.ByteCount
 }
 
 func (e eventPacketBuffered) Category() category { return categoryTransport }
@@ -235,14 +256,16 @@ func (e eventPacketBuffered) IsNil() bool        { return false }
 
 func (e eventPacketBuffered) MarshalJSONObject(enc *gojay.Encoder) {
 	//nolint:gosimple
-	enc.ObjectKey("header", packetHeaderWithType{PacketType: e.PacketType})
+	enc.ObjectKey("header", packetHeaderWithType{PacketType: e.PacketType, PacketNumber: protocol.InvalidPacketNumber})
+	enc.ObjectKey("raw", rawInfo{Length: e.PacketSize})
 	enc.StringKey("trigger", "keys_unavailable")
 }
 
 type eventPacketDropped struct {
-	PacketType logging.PacketType
-	PacketSize protocol.ByteCount
-	Trigger    packetDropReason
+	PacketType   logging.PacketType
+	PacketSize   protocol.ByteCount
+	PacketNumber logging.PacketNumber
+	Trigger      packetDropReason
 }
 
 func (e eventPacketDropped) Category() category { return categoryTransport }
@@ -250,7 +273,10 @@ func (e eventPacketDropped) Name() string       { return "packet_dropped" }
 func (e eventPacketDropped) IsNil() bool        { return false }
 
 func (e eventPacketDropped) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.ObjectKey("header", packetHeaderWithType{PacketType: e.PacketType})
+	enc.ObjectKey("header", packetHeaderWithType{
+		PacketType:   e.PacketType,
+		PacketNumber: e.PacketNumber,
+	})
 	enc.ObjectKey("raw", rawInfo{Length: e.PacketSize})
 	enc.StringKey("trigger", e.Trigger.String())
 }
@@ -264,6 +290,20 @@ type metrics struct {
 	CongestionWindow protocol.ByteCount
 	BytesInFlight    protocol.ByteCount
 	PacketsInFlight  int
+}
+
+type eventMTUUpdated struct {
+	mtu  protocol.ByteCount
+	done bool
+}
+
+func (e eventMTUUpdated) Category() category { return categoryRecovery }
+func (e eventMTUUpdated) Name() string       { return "mtu_updated" }
+func (e eventMTUUpdated) IsNil() bool        { return false }
+
+func (e eventMTUUpdated) MarshalJSONObject(enc *gojay.Encoder) {
+	enc.Uint64Key("mtu", uint64(e.mtu))
+	enc.BoolKey("done", e.done)
 }
 
 type eventMetricsUpdated struct {
@@ -296,7 +336,7 @@ func (e eventMetricsUpdated) MarshalJSONObject(enc *gojay.Encoder) {
 		enc.Uint64Key("bytes_in_flight", uint64(e.Current.BytesInFlight))
 	}
 	if e.Last == nil || e.Last.PacketsInFlight != e.Current.PacketsInFlight {
-		enc.Uint64KeyOmitEmpty("packets_in_flight", uint64(e.Current.PacketsInFlight))
+		enc.Uint64Key("packets_in_flight", uint64(e.Current.PacketsInFlight))
 	}
 }
 
@@ -331,9 +371,9 @@ func (e eventPacketLost) MarshalJSONObject(enc *gojay.Encoder) {
 }
 
 type eventKeyUpdated struct {
-	Trigger    keyUpdateTrigger
-	KeyType    keyType
-	Generation protocol.KeyPhase
+	Trigger  keyUpdateTrigger
+	KeyType  keyType
+	KeyPhase protocol.KeyPhase
 	// we don't log the keys here, so we don't need `old` and `new`.
 }
 
@@ -345,26 +385,26 @@ func (e eventKeyUpdated) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.StringKey("trigger", e.Trigger.String())
 	enc.StringKey("key_type", e.KeyType.String())
 	if e.KeyType == keyTypeClient1RTT || e.KeyType == keyTypeServer1RTT {
-		enc.Uint64Key("generation", uint64(e.Generation))
+		enc.Uint64Key("key_phase", uint64(e.KeyPhase))
 	}
 }
 
-type eventKeyRetired struct {
-	KeyType    keyType
-	Generation protocol.KeyPhase
+type eventKeyDiscarded struct {
+	KeyType  keyType
+	KeyPhase protocol.KeyPhase
 }
 
-func (e eventKeyRetired) Category() category { return categorySecurity }
-func (e eventKeyRetired) Name() string       { return "key_retired" }
-func (e eventKeyRetired) IsNil() bool        { return false }
+func (e eventKeyDiscarded) Category() category { return categorySecurity }
+func (e eventKeyDiscarded) Name() string       { return "key_discarded" }
+func (e eventKeyDiscarded) IsNil() bool        { return false }
 
-func (e eventKeyRetired) MarshalJSONObject(enc *gojay.Encoder) {
+func (e eventKeyDiscarded) MarshalJSONObject(enc *gojay.Encoder) {
 	if e.KeyType != keyTypeClient1RTT && e.KeyType != keyTypeServer1RTT {
 		enc.StringKey("trigger", "tls")
 	}
 	enc.StringKey("key_type", e.KeyType.String())
 	if e.KeyType == keyTypeClient1RTT || e.KeyType == keyTypeServer1RTT {
-		enc.Uint64Key("generation", uint64(e.Generation))
+		enc.Uint64Key("key_phase", uint64(e.KeyPhase))
 	}
 }
 
@@ -410,15 +450,15 @@ func (e eventTransportParameters) MarshalJSONObject(enc *gojay.Encoder) {
 	if !e.Restore {
 		enc.StringKey("owner", e.Owner.String())
 		if e.SentBy == protocol.PerspectiveServer {
-			enc.StringKey("original_destination_connection_id", connectionID(e.OriginalDestinationConnectionID).String())
+			enc.StringKey("original_destination_connection_id", e.OriginalDestinationConnectionID.String())
 			if e.StatelessResetToken != nil {
 				enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", e.StatelessResetToken[:]))
 			}
 			if e.RetrySourceConnectionID != nil {
-				enc.StringKey("retry_source_connection_id", connectionID(*e.RetrySourceConnectionID).String())
+				enc.StringKey("retry_source_connection_id", (*e.RetrySourceConnectionID).String())
 			}
 		}
-		enc.StringKey("initial_source_connection_id", connectionID(e.InitialSourceConnectionID).String())
+		enc.StringKey("initial_source_connection_id", e.InitialSourceConnectionID.String())
 	}
 	enc.BoolKey("disable_active_migration", e.DisableActiveMigration)
 	enc.FloatKeyOmitEmpty("max_idle_timeout", milliseconds(e.MaxIdleTimeout))
@@ -443,8 +483,7 @@ func (e eventTransportParameters) MarshalJSONObject(enc *gojay.Encoder) {
 }
 
 type preferredAddress struct {
-	IPv4, IPv6          net.IP
-	PortV4, PortV6      uint16
+	IPv4, IPv6          netip.AddrPort
 	ConnectionID        protocol.ConnectionID
 	StatelessResetToken protocol.StatelessResetToken
 }
@@ -453,11 +492,11 @@ var _ gojay.MarshalerJSONObject = &preferredAddress{}
 
 func (a preferredAddress) IsNil() bool { return false }
 func (a preferredAddress) MarshalJSONObject(enc *gojay.Encoder) {
-	enc.StringKey("ip_v4", a.IPv4.String())
-	enc.Uint16Key("port_v4", a.PortV4)
-	enc.StringKey("ip_v6", a.IPv6.String())
-	enc.Uint16Key("port_v6", a.PortV6)
-	enc.StringKey("connection_id", connectionID(a.ConnectionID).String())
+	enc.StringKey("ip_v4", a.IPv4.Addr().String())
+	enc.Uint16Key("port_v4", a.IPv4.Port())
+	enc.StringKey("ip_v6", a.IPv6.Addr().String())
+	enc.Uint16Key("port_v6", a.IPv6.Port())
+	enc.StringKey("connection_id", a.ConnectionID.String())
 	enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", a.StatelessResetToken))
 }
 
@@ -515,6 +554,20 @@ func (e eventCongestionStateUpdated) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.StringKey("new", e.state.String())
 }
 
+type eventECNStateUpdated struct {
+	state   logging.ECNState
+	trigger logging.ECNStateTrigger
+}
+
+func (e eventECNStateUpdated) Category() category { return categoryRecovery }
+func (e eventECNStateUpdated) Name() string       { return "ecn_state_updated" }
+func (e eventECNStateUpdated) IsNil() bool        { return false }
+
+func (e eventECNStateUpdated) MarshalJSONObject(enc *gojay.Encoder) {
+	enc.StringKey("new", ecnState(e.state).String())
+	enc.StringKeyOmitEmpty("trigger", ecnStateTrigger(e.trigger).String())
+}
+
 type eventGeneric struct {
 	name string
 	msg  string
@@ -526,4 +579,16 @@ func (e eventGeneric) IsNil() bool        { return false }
 
 func (e eventGeneric) MarshalJSONObject(enc *gojay.Encoder) {
 	enc.StringKey("details", e.msg)
+}
+
+type eventALPNInformation struct {
+	chosenALPN string
+}
+
+func (e eventALPNInformation) Category() category { return categoryTransport }
+func (e eventALPNInformation) Name() string       { return "alpn_information" }
+func (e eventALPNInformation) IsNil() bool        { return false }
+
+func (e eventALPNInformation) MarshalJSONObject(enc *gojay.Encoder) {
+	enc.StringKey("chosen_alpn", e.chosenALPN)
 }

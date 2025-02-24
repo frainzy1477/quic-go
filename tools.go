@@ -1,9 +1,8 @@
 //go:build tools
-// +build tools
 
 package quic
 
 import (
-	_ "github.com/cheekybits/genny"
-	_ "github.com/onsi/ginkgo/ginkgo"
+	_ "github.com/onsi/ginkgo/v2/ginkgo"
+	_ "go.uber.org/mock/mockgen"
 )

@@ -1,163 +1,317 @@
 package self_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"net"
-	"sync"
+	"testing"
+	"time"
 
-	quic "github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"golang.org/x/sync/errgroup"
+
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Bidirectional streams", func() {
-	const numStreams = 300
+func TestBidirectionalStreamMultiplexing(t *testing.T) {
+	const numStreams = 75
 
-	var (
-		server     quic.Listener
-		serverAddr string
-		qconf      *quic.Config
-	)
-
-	for _, v := range []protocol.VersionNumber{protocol.VersionTLS} {
-		version := v
-
-		Context(fmt.Sprintf("with QUIC %s", version), func() {
-			BeforeEach(func() {
-				var err error
-				qconf = &quic.Config{
-					Versions:           []protocol.VersionNumber{version},
-					MaxIncomingStreams: 0,
-				}
-				server, err = quic.ListenAddr("localhost:0", getTLSConfig(), getQuicConfig(qconf))
-				Expect(err).ToNot(HaveOccurred())
-				serverAddr = fmt.Sprintf("localhost:%d", server.Addr().(*net.UDPAddr).Port)
-			})
-
-			AfterEach(func() {
-				server.Close()
-			})
-
-			runSendingPeer := func(sess quic.Session) {
-				var wg sync.WaitGroup
-				wg.Add(numStreams)
-				for i := 0; i < numStreams; i++ {
-					str, err := sess.OpenStreamSync(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					data := GeneratePRData(25 * i)
-					go func() {
-						defer GinkgoRecover()
-						_, err := str.Write(data)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(str.Close()).To(Succeed())
-					}()
-					go func() {
-						defer GinkgoRecover()
-						defer wg.Done()
-						dataRead, err := io.ReadAll(str)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(dataRead).To(Equal(data))
-					}()
-				}
-				wg.Wait()
+	runSendingPeer := func(conn quic.Connection) error {
+		g := new(errgroup.Group)
+		for i := 0; i < numStreams; i++ {
+			str, err := conn.OpenStreamSync(context.Background())
+			if err != nil {
+				return err
 			}
-
-			runReceivingPeer := func(sess quic.Session) {
-				var wg sync.WaitGroup
-				wg.Add(numStreams)
-				for i := 0; i < numStreams; i++ {
-					str, err := sess.AcceptStream(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					go func() {
-						defer GinkgoRecover()
-						defer wg.Done()
-						// shouldn't use io.Copy here
-						// we should read from the stream as early as possible, to free flow control credit
-						data, err := io.ReadAll(str)
-						Expect(err).ToNot(HaveOccurred())
-						_, err = str.Write(data)
-						Expect(err).ToNot(HaveOccurred())
-						Expect(str.Close()).To(Succeed())
-					}()
+			data := GeneratePRData(50 * i)
+			g.Go(func() error {
+				if _, err := str.Write(data); err != nil {
+					return err
 				}
-				wg.Wait()
-			}
-
-			It(fmt.Sprintf("client opening %d streams to a server", numStreams), func() {
-				var sess quic.Session
-				go func() {
-					defer GinkgoRecover()
-					var err error
-					sess, err = server.Accept(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					runReceivingPeer(sess)
-				}()
-
-				client, err := quic.DialAddr(
-					serverAddr,
-					getTLSClientConfig(),
-					getQuicConfig(qconf),
-				)
-				Expect(err).ToNot(HaveOccurred())
-				runSendingPeer(client)
+				return str.Close()
 			})
-
-			It(fmt.Sprintf("server opening %d streams to a client", numStreams), func() {
-				go func() {
-					defer GinkgoRecover()
-					sess, err := server.Accept(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					runSendingPeer(sess)
-					sess.CloseWithError(0, "")
-				}()
-
-				client, err := quic.DialAddr(
-					serverAddr,
-					getTLSClientConfig(),
-					getQuicConfig(qconf),
-				)
-				Expect(err).ToNot(HaveOccurred())
-				runReceivingPeer(client)
-				Eventually(client.Context().Done()).Should(BeClosed())
+			g.Go(func() error {
+				dataRead, err := io.ReadAll(str)
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(dataRead, data) {
+					return fmt.Errorf("data mismatch: %q != %q", dataRead, data)
+				}
+				return nil
 			})
-
-			It(fmt.Sprintf("client and server opening %d each and sending data to the peer", numStreams), func() {
-				done1 := make(chan struct{})
-				go func() {
-					defer GinkgoRecover()
-					sess, err := server.Accept(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					done := make(chan struct{})
-					go func() {
-						defer GinkgoRecover()
-						runReceivingPeer(sess)
-						close(done)
-					}()
-					runSendingPeer(sess)
-					<-done
-					close(done1)
-				}()
-
-				client, err := quic.DialAddr(
-					serverAddr,
-					getTLSClientConfig(),
-					getQuicConfig(qconf),
-				)
-				Expect(err).ToNot(HaveOccurred())
-				done2 := make(chan struct{})
-				go func() {
-					defer GinkgoRecover()
-					runSendingPeer(client)
-					close(done2)
-				}()
-				runReceivingPeer(client)
-				<-done1
-				<-done2
-			})
-		})
+		}
+		return g.Wait()
 	}
-})
+
+	runReceivingPeer := func(conn quic.Connection) error {
+		g := new(errgroup.Group)
+		for i := 0; i < numStreams; i++ {
+			str, err := conn.AcceptStream(context.Background())
+			if err != nil {
+				return err
+			}
+			g.Go(func() error {
+				// shouldn't use io.Copy here
+				// we should read from the stream as early as possible, to free flow control credit
+				data, err := io.ReadAll(str)
+				if err != nil {
+					return err
+				}
+				if _, err := str.Write(data); err != nil {
+					return err
+				}
+				return str.Close()
+			})
+		}
+		return g.Wait()
+	}
+
+	t.Run("client -> server", func(t *testing.T) {
+		ln, err := quic.Listen(
+			newUDPConnLocalhost(t),
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{
+				MaxIncomingStreams:             10,
+				InitialStreamReceiveWindow:     10000,
+				InitialConnectionReceiveWindow: 5000,
+			}),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		client, err := quic.Dial(
+			ctx,
+			newUDPConnLocalhost(t),
+			ln.Addr(),
+			getTLSClientConfig(),
+			getQuicConfig(&quic.Config{InitialConnectionReceiveWindow: 2000}),
+		)
+		require.NoError(t, err)
+
+		conn, err := ln.Accept(ctx)
+		require.NoError(t, err)
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- runReceivingPeer(conn) }()
+		require.NoError(t, runSendingPeer(client))
+		client.CloseWithError(0, "")
+
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.Fail(t, "timeout")
+		}
+		select {
+		case <-conn.Context().Done():
+		case <-time.After(time.Second):
+			require.Fail(t, "timeout")
+		}
+	})
+
+	t.Run("client <-> server", func(t *testing.T) {
+		ln, err := quic.Listen(
+			newUDPConnLocalhost(t),
+			getTLSConfig(),
+			getQuicConfig(&quic.Config{
+				MaxIncomingStreams:             30,
+				InitialStreamReceiveWindow:     25000,
+				InitialConnectionReceiveWindow: 50000,
+			}),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		client, err := quic.Dial(
+			ctx,
+			newUDPConnLocalhost(t),
+			ln.Addr(),
+			getTLSClientConfig(),
+			getQuicConfig(&quic.Config{InitialConnectionReceiveWindow: 2000}),
+		)
+		require.NoError(t, err)
+
+		conn, err := ln.Accept(ctx)
+		require.NoError(t, err)
+
+		errChan1 := make(chan error, 1)
+		errChan2 := make(chan error, 1)
+		errChan3 := make(chan error, 1)
+		errChan4 := make(chan error, 1)
+
+		go func() { errChan1 <- runReceivingPeer(conn) }()
+		go func() { errChan2 <- runSendingPeer(conn) }()
+		go func() { errChan3 <- runReceivingPeer(client) }()
+		go func() { errChan4 <- runSendingPeer(client) }()
+
+		for _, ch := range []chan error{errChan1, errChan2, errChan3, errChan4} {
+			select {
+			case err := <-ch:
+				require.NoError(t, err)
+			case <-time.After(time.Second):
+				require.Fail(t, "timeout")
+			}
+		}
+
+		client.CloseWithError(0, "")
+		select {
+		case <-conn.Context().Done():
+		case <-time.After(time.Second):
+			require.Fail(t, "timeout")
+		}
+	})
+}
+
+func TestUnidirectionalStreams(t *testing.T) {
+	const numStreams = 500
+
+	dataForStream := func(id uint64) []byte { return GeneratePRData(10 * int(id)) }
+
+	runSendingPeer := func(conn quic.Connection) error {
+		g := new(errgroup.Group)
+		for i := 0; i < numStreams; i++ {
+			str, err := conn.OpenUniStreamSync(context.Background())
+			if err != nil {
+				return err
+			}
+			g.Go(func() error {
+				if _, err := str.Write(dataForStream(uint64(str.StreamID()))); err != nil {
+					return err
+				}
+				return str.Close()
+			})
+		}
+		return g.Wait()
+	}
+
+	runReceivingPeer := func(conn quic.Connection) error {
+		g := new(errgroup.Group)
+		for i := 0; i < numStreams; i++ {
+			str, err := conn.AcceptUniStream(context.Background())
+			if err != nil {
+				return err
+			}
+			g.Go(func() error {
+				data, err := io.ReadAll(str)
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(data, dataForStream(uint64(str.StreamID()))) {
+					return fmt.Errorf("data mismatch")
+				}
+				return nil
+			})
+		}
+		return g.Wait()
+	}
+
+	t.Run("client -> server", func(t *testing.T) {
+		ln, err := quic.Listen(
+			newUDPConnLocalhost(t),
+			getTLSConfig(),
+			getQuicConfig(nil),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		client, err := quic.Dial(ctx, newUDPConnLocalhost(t), ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+		require.NoError(t, err)
+
+		serverConn, err := ln.Accept(ctx)
+		require.NoError(t, err)
+		errChan := make(chan error, 1)
+		go func() { errChan <- runSendingPeer(client) }()
+		require.NoError(t, runReceivingPeer(serverConn))
+		serverConn.CloseWithError(0, "")
+
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.Fail(t, "timeout")
+		}
+	})
+
+	t.Run("server -> client", func(t *testing.T) {
+		ln, err := quic.Listen(
+			newUDPConnLocalhost(t),
+			getTLSConfig(),
+			getQuicConfig(nil),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		client, err := quic.Dial(ctx, newUDPConnLocalhost(t), ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+		require.NoError(t, err)
+
+		serverConn, err := ln.Accept(ctx)
+		require.NoError(t, err)
+		errChan := make(chan error, 1)
+		go func() { errChan <- runSendingPeer(serverConn) }()
+
+		require.NoError(t, runReceivingPeer(client))
+		client.CloseWithError(0, "")
+
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		case <-time.After(time.Second):
+			require.Fail(t, "timeout")
+		}
+	})
+
+	t.Run("client <-> server", func(t *testing.T) {
+		ln, err := quic.Listen(
+			newUDPConnLocalhost(t),
+			getTLSConfig(),
+			getQuicConfig(nil),
+		)
+		require.NoError(t, err)
+		defer ln.Close()
+
+		errChan1 := make(chan error, 1)
+		errChan2 := make(chan error, 1)
+		go func() {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				errChan1 <- err
+				errChan2 <- err
+				return
+			}
+			errChan1 <- runReceivingPeer(conn)
+			errChan2 <- runSendingPeer(conn)
+		}()
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		client, err := quic.Dial(ctx, newUDPConnLocalhost(t), ln.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+		require.NoError(t, err)
+
+		errChan3 := make(chan error, 1)
+		go func() {
+			errChan3 <- runSendingPeer(client)
+		}()
+		require.NoError(t, runReceivingPeer(client))
+
+		for _, ch := range []chan error{errChan1, errChan2, errChan3} {
+			select {
+			case err := <-ch:
+				require.NoError(t, err)
+			case <-time.After(time.Second):
+				require.Fail(t, "timeout")
+			}
+		}
+		client.CloseWithError(0, "")
+	})
+}

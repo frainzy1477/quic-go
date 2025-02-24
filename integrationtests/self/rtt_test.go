@@ -5,114 +5,138 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"testing"
 	"time"
 
-	quic "github.com/lucas-clemente/quic-go"
-	quicproxy "github.com/lucas-clemente/quic-go/integrationtests/tools/proxy"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/quic-go/quic-go"
+	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("non-zero RTT", func() {
-	for _, v := range protocol.SupportedVersions {
-		version := v
+func runServerForRTTTest(t *testing.T) (net.Addr, <-chan error) {
+	ln, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(nil),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { ln.Close() })
 
-		runServer := func() quic.Listener {
-			ln, err := quic.ListenAddr(
-				"localhost:0",
-				getTLSConfig(),
-				getQuicConfig(&quic.Config{Versions: []protocol.VersionNumber{version}}),
-			)
-			Expect(err).ToNot(HaveOccurred())
-			go func() {
-				defer GinkgoRecover()
-				sess, err := ln.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				str, err := sess.OpenStream()
-				Expect(err).ToNot(HaveOccurred())
-				_, err = str.Write(PRData)
-				Expect(err).ToNot(HaveOccurred())
-				str.Close()
-			}()
-			return ln
+	errChan := make(chan error, 1)
+	go func() {
+		defer close(errChan)
+		for {
+			conn, err := ln.Accept(context.Background())
+			if err != nil {
+				errChan <- fmt.Errorf("accept error: %w", err)
+				return
+			}
+			str, err := conn.OpenStream()
+			if err != nil {
+				errChan <- fmt.Errorf("open stream error: %w", err)
+				return
+			}
+			_, err = str.Write(PRData)
+			if err != nil {
+				errChan <- fmt.Errorf("write error: %w", err)
+				return
+			}
+			str.Close()
 		}
+	}()
 
-		downloadFile := func(port int) {
-			sess, err := quic.DialAddr(
-				fmt.Sprintf("localhost:%d", port),
+	return ln.Addr(), errChan
+}
+
+func TestDownloadWithFixedRTT(t *testing.T) {
+	addr, errChan := runServerForRTTTest(t)
+
+	for _, rtt := range []time.Duration{
+		10 * time.Millisecond,
+		100 * time.Millisecond,
+		250 * time.Millisecond,
+	} {
+		t.Run(fmt.Sprintf("RTT %s", rtt), func(t *testing.T) {
+			t.Cleanup(func() {
+				select {
+				case err := <-errChan:
+					t.Errorf("server error: %v", err)
+				default:
+				}
+			})
+
+			proxy := quicproxy.Proxy{
+				Conn:        newUDPConnLocalhost(t),
+				ServerAddr:  &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: addr.(*net.UDPAddr).Port},
+				DelayPacket: func(quicproxy.Direction, net.Addr, net.Addr, []byte) time.Duration { return rtt / 2 },
+			}
+			require.NoError(t, proxy.Start())
+			t.Cleanup(func() { proxy.Close() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, err := quic.Dial(
+				ctx,
+				newUDPConnLocalhost(t),
+				proxy.LocalAddr(),
 				getTLSClientConfig(),
-				getQuicConfig(&quic.Config{Versions: []protocol.VersionNumber{version}}),
+				getQuicConfig(nil),
 			)
-			Expect(err).ToNot(HaveOccurred())
-			str, err := sess.AcceptStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
+			require.NoError(t, err)
+			defer conn.CloseWithError(0, "")
+
+			str, err := conn.AcceptStream(ctx)
+			require.NoError(t, err)
 			data, err := io.ReadAll(str)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal(PRData))
-			sess.CloseWithError(0, "")
-		}
-
-		Context(fmt.Sprintf("with QUIC version %s", version), func() {
-			for _, r := range [...]time.Duration{
-				10 * time.Millisecond,
-				50 * time.Millisecond,
-				100 * time.Millisecond,
-				200 * time.Millisecond,
-			} {
-				rtt := r
-
-				It(fmt.Sprintf("downloads a message with %s RTT", rtt), func() {
-					ln := runServer()
-					defer ln.Close()
-					serverPort := ln.Addr().(*net.UDPAddr).Port
-					proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-						RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-						DelayPacket: func(quicproxy.Direction, []byte) time.Duration {
-							return rtt / 2
-						},
-					})
-					Expect(err).ToNot(HaveOccurred())
-					defer proxy.Close()
-
-					sess, err := quic.DialAddr(
-						fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-						getTLSClientConfig(),
-						getQuicConfig(&quic.Config{Versions: []protocol.VersionNumber{version}}),
-					)
-					Expect(err).ToNot(HaveOccurred())
-					str, err := sess.AcceptStream(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					data, err := io.ReadAll(str)
-					Expect(err).ToNot(HaveOccurred())
-					Expect(data).To(Equal(PRData))
-					sess.CloseWithError(0, "")
-				})
-			}
-
-			for _, r := range [...]time.Duration{
-				10 * time.Millisecond,
-				40 * time.Millisecond,
-			} {
-				rtt := r
-
-				It(fmt.Sprintf("downloads a message with %s RTT, with reordering", rtt), func() {
-					ln := runServer()
-					defer ln.Close()
-					serverPort := ln.Addr().(*net.UDPAddr).Port
-					proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-						RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-						DelayPacket: func(quicproxy.Direction, []byte) time.Duration {
-							return randomDuration(rtt/2, rtt*3/2) / 2
-						},
-					})
-					Expect(err).ToNot(HaveOccurred())
-					defer proxy.Close()
-
-					downloadFile(proxy.LocalPort())
-				})
-			}
+			require.NoError(t, err)
+			require.Equal(t, PRData, data)
 		})
 	}
-})
+}
+
+func TestDownloadWithReordering(t *testing.T) {
+	addr, errChan := runServerForRTTTest(t)
+
+	for _, rtt := range []time.Duration{
+		5 * time.Millisecond,
+		30 * time.Millisecond,
+	} {
+		t.Run(fmt.Sprintf("RTT %s", rtt), func(t *testing.T) {
+			t.Cleanup(func() {
+				select {
+				case err := <-errChan:
+					t.Errorf("server error: %v", err)
+				default:
+				}
+			})
+
+			proxy := quicproxy.Proxy{
+				Conn:       newUDPConnLocalhost(t),
+				ServerAddr: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: addr.(*net.UDPAddr).Port},
+				DelayPacket: func(quicproxy.Direction, net.Addr, net.Addr, []byte) time.Duration {
+					return randomDuration(rtt/2, rtt*3/2) / 2
+				},
+			}
+			require.NoError(t, proxy.Start())
+			t.Cleanup(func() { proxy.Close() })
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			conn, err := quic.Dial(
+				ctx,
+				newUDPConnLocalhost(t),
+				proxy.LocalAddr(),
+				getTLSClientConfig(),
+				getQuicConfig(nil),
+			)
+			require.NoError(t, err)
+			defer conn.CloseWithError(0, "")
+
+			str, err := conn.AcceptStream(ctx)
+			require.NoError(t, err)
+			data, err := io.ReadAll(str)
+			require.NoError(t, err)
+			require.Equal(t, PRData, data)
+		})
+	}
+}

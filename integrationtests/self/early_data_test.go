@@ -2,71 +2,71 @@ package self_test
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net"
+	"testing"
 	"time"
 
-	quic "github.com/lucas-clemente/quic-go"
-	quicproxy "github.com/lucas-clemente/quic-go/integrationtests/tools/proxy"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go"
+	quicproxy "github.com/quic-go/quic-go/integrationtests/tools/proxy"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("early data", func() {
+func TestEarlyData(t *testing.T) {
 	const rtt = 80 * time.Millisecond
-	for _, v := range protocol.SupportedVersions {
-		version := v
+	ln, err := quic.ListenEarly(newUDPConnLocalhost(t), getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer ln.Close()
 
-		Context(fmt.Sprintf("with QUIC version %s", version), func() {
-			It("sends 0.5-RTT data", func() {
-				ln, err := quic.ListenAddrEarly(
-					"localhost:0",
-					getTLSConfig(),
-					getQuicConfig(&quic.Config{Versions: []protocol.VersionNumber{version}}),
-				)
-				Expect(err).ToNot(HaveOccurred())
-				done := make(chan struct{})
-				go func() {
-					defer GinkgoRecover()
-					defer close(done)
-					sess, err := ln.Accept(context.Background())
-					Expect(err).ToNot(HaveOccurred())
-					str, err := sess.OpenUniStream()
-					Expect(err).ToNot(HaveOccurred())
-					_, err = str.Write([]byte("early data"))
-					Expect(err).ToNot(HaveOccurred())
-					Expect(str.Close()).To(Succeed())
-					// make sure the Write finished before the handshake completed
-					Expect(sess.HandshakeComplete().Done()).ToNot(BeClosed())
-					Eventually(sess.Context().Done()).Should(BeClosed())
-				}()
-				serverPort := ln.Addr().(*net.UDPAddr).Port
-				proxy, err := quicproxy.NewQuicProxy("localhost:0", &quicproxy.Opts{
-					RemoteAddr: fmt.Sprintf("localhost:%d", serverPort),
-					DelayPacket: func(quicproxy.Direction, []byte) time.Duration {
-						return rtt / 2
-					},
-				})
-				Expect(err).ToNot(HaveOccurred())
-				defer proxy.Close()
-
-				sess, err := quic.DialAddr(
-					fmt.Sprintf("localhost:%d", proxy.LocalPort()),
-					getTLSClientConfig(),
-					getQuicConfig(&quic.Config{Versions: []protocol.VersionNumber{version}}),
-				)
-				Expect(err).ToNot(HaveOccurred())
-				str, err := sess.AcceptUniStream(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				data, err := io.ReadAll(str)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(data).To(Equal([]byte("early data")))
-				sess.CloseWithError(0, "")
-				Eventually(done).Should(BeClosed())
-			})
-		})
+	proxy := &quicproxy.Proxy{
+		Conn:        newUDPConnLocalhost(t),
+		ServerAddr:  ln.Addr().(*net.UDPAddr),
+		DelayPacket: func(quicproxy.Direction, net.Addr, net.Addr, []byte) time.Duration { return rtt / 2 },
 	}
-})
+	require.NoError(t, proxy.Start())
+	defer proxy.Close()
+
+	connChan := make(chan quic.EarlyConnection)
+	errChan := make(chan error)
+	go func() {
+		conn, err := ln.Accept(context.Background())
+		if err != nil {
+			errChan <- err
+			return
+		}
+		connChan <- conn
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	clientConn, err := quic.Dial(ctx, newUDPConnLocalhost(t), proxy.LocalAddr(), getTLSClientConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+
+	var serverConn quic.EarlyConnection
+	select {
+	case serverConn = <-connChan:
+	case err := <-errChan:
+		t.Fatalf("error accepting connection: %s", err)
+	}
+	str, err := serverConn.OpenUniStream()
+	require.NoError(t, err)
+	_, err = str.Write([]byte("early data"))
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+	// the write should have completed before the handshake
+	select {
+	case <-serverConn.HandshakeComplete():
+		t.Fatal("handshake shouldn't be completed yet")
+	default:
+	}
+
+	clientStr, err := clientConn.AcceptUniStream(context.Background())
+	require.NoError(t, err)
+	data, err := io.ReadAll(clientStr)
+	require.NoError(t, err)
+	require.Equal(t, []byte("early data"), data)
+
+	clientConn.CloseWithError(0, "")
+	<-serverConn.Context().Done()
+}

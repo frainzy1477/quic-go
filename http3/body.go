@@ -1,98 +1,133 @@
 package http3
 
 import (
-	"fmt"
+	"context"
+	"errors"
 	"io"
+	"sync"
 
-	"github.com/lucas-clemente/quic-go"
+	"github.com/quic-go/quic-go"
 )
 
-// The body of a http.Request or http.Response.
+// A Hijacker allows hijacking of the stream creating part of a quic.Session from a http.Response.Body.
+// It is used by WebTransport to create WebTransport streams after a session has been established.
+type Hijacker interface {
+	Connection() Connection
+}
+
+var errTooMuchData = errors.New("peer sent too much data")
+
+// The body is used in the requestBody (for a http.Request) and the responseBody (for a http.Response).
 type body struct {
-	str quic.Stream
+	str *stream
+
+	remainingContentLength int64
+	violatedContentLength  bool
+	hasContentLength       bool
+}
+
+func newBody(str *stream, contentLength int64) *body {
+	b := &body{str: str}
+	if contentLength >= 0 {
+		b.hasContentLength = true
+		b.remainingContentLength = contentLength
+	}
+	return b
+}
+
+func (r *body) StreamID() quic.StreamID { return r.str.StreamID() }
+
+func (r *body) checkContentLengthViolation() error {
+	if !r.hasContentLength {
+		return nil
+	}
+	if r.remainingContentLength < 0 || r.remainingContentLength == 0 && r.str.hasMoreData() {
+		if !r.violatedContentLength {
+			r.str.CancelRead(quic.StreamErrorCode(ErrCodeMessageError))
+			r.str.CancelWrite(quic.StreamErrorCode(ErrCodeMessageError))
+			r.violatedContentLength = true
+		}
+		return errTooMuchData
+	}
+	return nil
+}
+
+func (r *body) Read(b []byte) (int, error) {
+	if err := r.checkContentLengthViolation(); err != nil {
+		return 0, err
+	}
+	if r.hasContentLength {
+		b = b[:min(int64(len(b)), r.remainingContentLength)]
+	}
+	n, err := r.str.Read(b)
+	r.remainingContentLength -= int64(n)
+	if err := r.checkContentLengthViolation(); err != nil {
+		return n, err
+	}
+	return n, maybeReplaceError(err)
+}
+
+func (r *body) Close() error {
+	r.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestCanceled))
+	return nil
+}
+
+type requestBody struct {
+	body
+	connCtx      context.Context
+	rcvdSettings <-chan struct{}
+	getSettings  func() *Settings
+}
+
+var _ io.ReadCloser = &requestBody{}
+
+func newRequestBody(str *stream, contentLength int64, connCtx context.Context, rcvdSettings <-chan struct{}, getSettings func() *Settings) *requestBody {
+	return &requestBody{
+		body:         *newBody(str, contentLength),
+		connCtx:      connCtx,
+		rcvdSettings: rcvdSettings,
+		getSettings:  getSettings,
+	}
+}
+
+type hijackableBody struct {
+	body body
 
 	// only set for the http.Response
 	// The channel is closed when the user is done with this response:
 	// either when Read() errors, or when Close() is called.
-	reqDone       chan<- struct{}
-	reqDoneClosed bool
-
-	onFrameError func()
-
-	bytesRemainingInFrame uint64
+	reqDone     chan<- struct{}
+	reqDoneOnce sync.Once
 }
 
-var _ io.ReadCloser = &body{}
+var _ io.ReadCloser = &hijackableBody{}
 
-func newRequestBody(str quic.Stream, onFrameError func()) *body {
-	return &body{
-		str:          str,
-		onFrameError: onFrameError,
+func newResponseBody(str *stream, contentLength int64, done chan<- struct{}) *hijackableBody {
+	return &hijackableBody{
+		body:    *newBody(str, contentLength),
+		reqDone: done,
 	}
 }
 
-func newResponseBody(str quic.Stream, done chan<- struct{}, onFrameError func()) *body {
-	return &body{
-		str:          str,
-		onFrameError: onFrameError,
-		reqDone:      done,
-	}
-}
-
-func (r *body) Read(b []byte) (int, error) {
-	n, err := r.readImpl(b)
+func (r *hijackableBody) Read(b []byte) (int, error) {
+	n, err := r.body.Read(b)
 	if err != nil {
 		r.requestDone()
 	}
-	return n, err
+	return n, maybeReplaceError(err)
 }
 
-func (r *body) readImpl(b []byte) (int, error) {
-	if r.bytesRemainingInFrame == 0 {
-	parseLoop:
-		for {
-			frame, err := parseNextFrame(r.str)
-			if err != nil {
-				return 0, err
-			}
-			switch f := frame.(type) {
-			case *headersFrame:
-				// skip HEADERS frames
-				continue
-			case *dataFrame:
-				r.bytesRemainingInFrame = f.Length
-				break parseLoop
-			default:
-				r.onFrameError()
-				// parseNextFrame skips over unknown frame types
-				// Therefore, this condition is only entered when we parsed another known frame type.
-				return 0, fmt.Errorf("peer sent an unexpected frame: %T", f)
-			}
-		}
+func (r *hijackableBody) requestDone() {
+	if r.reqDone != nil {
+		r.reqDoneOnce.Do(func() {
+			close(r.reqDone)
+		})
 	}
-
-	var n int
-	var err error
-	if r.bytesRemainingInFrame < uint64(len(b)) {
-		n, err = r.str.Read(b[:r.bytesRemainingInFrame])
-	} else {
-		n, err = r.str.Read(b)
-	}
-	r.bytesRemainingInFrame -= uint64(n)
-	return n, err
 }
 
-func (r *body) requestDone() {
-	if r.reqDoneClosed || r.reqDone == nil {
-		return
-	}
-	close(r.reqDone)
-	r.reqDoneClosed = true
-}
-
-func (r *body) Close() error {
+func (r *hijackableBody) Close() error {
 	r.requestDone()
 	// If the EOF was read, CancelRead() is a no-op.
-	r.str.CancelRead(quic.StreamErrorCode(errorRequestCanceled))
+	r.body.str.CancelRead(quic.StreamErrorCode(ErrCodeRequestCanceled))
 	return nil
 }

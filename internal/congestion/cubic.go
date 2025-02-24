@@ -4,8 +4,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/protocol"
 )
 
 // This cubic implementation is based on the one found in Chromiums's QUIC
@@ -18,11 +17,11 @@ import (
 // 1024*1024^3 (first 1024 is from 0.100^3)
 // where 0.100 is 100 ms which is the scaling round trip time.
 const (
-	cubeScale                                    = 40
-	cubeCongestionWindowScale                    = 410
-	cubeFactor                protocol.ByteCount = 1 << cubeScale / cubeCongestionWindowScale / maxDatagramSize
+	cubeScale                 = 40
+	cubeCongestionWindowScale = 410
+	cubeFactor                = 1 << cubeScale / cubeCongestionWindowScale / maxDatagramSize
 	// TODO: when re-enabling cubic, make sure to use the actual packet size here
-	maxDatagramSize = protocol.ByteCount(protocol.InitialPacketSizeIPv4)
+	maxDatagramSize = protocol.ByteCount(protocol.InitialPacketSize)
 )
 
 const defaultNumConnections = 1
@@ -187,7 +186,7 @@ func (c *Cubic) CongestionWindowAfterAck(
 		targetCongestionWindow = c.originPointCongestionWindow - deltaCongestionWindow
 	}
 	// Limit the CWND increase to half the acked bytes.
-	targetCongestionWindow = utils.MinByteCount(targetCongestionWindow, currentCongestionWindow+c.ackedBytesCount/2)
+	targetCongestionWindow = min(targetCongestionWindow, currentCongestionWindow+c.ackedBytesCount/2)
 
 	// Increase the window by approximately Alpha * 1 MSS of bytes every
 	// time we ack an estimated tcp window of bytes.  For small

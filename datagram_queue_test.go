@@ -1,98 +1,161 @@
 package quic
 
 import (
+	"context"
 	"errors"
+	"testing"
+	"time"
 
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/wire"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-var _ = Describe("Datagram Queue", func() {
-	var queue *datagramQueue
-	var queued chan struct{}
+func TestDatagramQueuePeekAndPop(t *testing.T) {
+	var queued []struct{}
+	queue := newDatagramQueue(func() { queued = append(queued, struct{}{}) }, utils.DefaultLogger)
+	require.Nil(t, queue.Peek())
+	require.Empty(t, queued)
+	require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte("foo")}))
+	require.Len(t, queued, 1)
+	require.Equal(t, &wire.DatagramFrame{Data: []byte("foo")}, queue.Peek())
+	// calling peek again returns the same datagram
+	require.Equal(t, &wire.DatagramFrame{Data: []byte("foo")}, queue.Peek())
+	queue.Pop()
+	require.Nil(t, queue.Peek())
+}
 
-	BeforeEach(func() {
-		queued = make(chan struct{}, 100)
-		queue = newDatagramQueue(func() {
-			queued <- struct{}{}
-		}, utils.DefaultLogger)
-	})
+func TestDatagramQueueSendQueueLength(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
 
-	Context("sending", func() {
-		It("returns nil when there's no datagram to send", func() {
-			Expect(queue.Get()).To(BeNil())
-		})
+	for i := 0; i < maxDatagramSendQueueLen; i++ {
+		require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte{0}}))
+	}
+	errChan := make(chan error, 1)
+	go func() { errChan <- queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}) }()
 
-		It("queues a datagram", func() {
-			done := make(chan struct{})
-			go func() {
-				defer GinkgoRecover()
-				defer close(done)
-				Expect(queue.AddAndWait(&wire.DatagramFrame{Data: []byte("foobar")})).To(Succeed())
-			}()
+	select {
+	case <-errChan:
+		t.Fatal("expected to not receive error")
+	case <-time.After(scaleDuration(10 * time.Millisecond)):
+	}
 
-			Eventually(queued).Should(HaveLen(1))
-			Consistently(done).ShouldNot(BeClosed())
-			f := queue.Get()
-			Expect(f).ToNot(BeNil())
-			Expect(f.Data).To(Equal([]byte("foobar")))
-			Eventually(done).Should(BeClosed())
-			Expect(queue.Get()).To(BeNil())
-		})
+	// peeking doesn't remove the datagram from the queue...
+	require.NotNil(t, queue.Peek())
+	select {
+	case <-errChan:
+		t.Fatal("expected to not receive error")
+	case <-time.After(scaleDuration(10 * time.Millisecond)):
+	}
 
-		It("closes", func() {
-			errChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				errChan <- queue.AddAndWait(&wire.DatagramFrame{Data: []byte("foobar")})
-			}()
+	// ...but popping does
+	queue.Pop()
+	select {
+	case err := <-errChan:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+	// pop all the remaining datagrams
+	for i := 1; i < maxDatagramSendQueueLen; i++ {
+		queue.Pop()
+	}
+	f := queue.Peek()
+	require.NotNil(t, f)
+	require.Equal(t, &wire.DatagramFrame{Data: []byte("foobar")}, f)
+}
 
-			Consistently(errChan).ShouldNot(Receive())
-			queue.CloseWithError(errors.New("test error"))
-			Eventually(errChan).Should(Receive(MatchError("test error")))
-		})
-	})
+func TestDatagramQueueReceive(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
 
-	Context("receiving", func() {
-		It("receives DATAGRAM frames", func() {
-			queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("foo")})
-			queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("bar")})
-			data, err := queue.Receive()
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal([]byte("foo")))
-			data, err = queue.Receive()
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal([]byte("bar")))
-		})
+	// receive frames that were received earlier
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("foo")})
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("bar")})
+	data, err := queue.Receive(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []byte("foo"), data)
+	data, err = queue.Receive(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []byte("bar"), data)
+}
 
-		It("blocks until a frame is received", func() {
-			c := make(chan []byte, 1)
-			go func() {
-				defer GinkgoRecover()
-				data, err := queue.Receive()
-				Expect(err).ToNot(HaveOccurred())
-				c <- data
-			}()
+func TestDatagramQueueReceiveBlocking(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
 
-			Consistently(c).ShouldNot(Receive())
-			queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("foobar")})
-			Eventually(c).Should(Receive(Equal([]byte("foobar"))))
-		})
+	// block until a new frame is received
+	type result struct {
+		data []byte
+		err  error
+	}
+	resultChan := make(chan result, 1)
+	go func() {
+		data, err := queue.Receive(context.Background())
+		resultChan <- result{data, err}
+	}()
 
-		It("closes", func() {
-			errChan := make(chan error, 1)
-			go func() {
-				defer GinkgoRecover()
-				_, err := queue.Receive()
-				errChan <- err
-			}()
+	select {
+	case <-resultChan:
+		t.Fatal("expected to not receive result")
+	case <-time.After(scaleDuration(10 * time.Millisecond)):
+	}
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("foobar")})
+	select {
+	case result := <-resultChan:
+		require.NoError(t, result.err)
+		require.Equal(t, []byte("foobar"), result.data)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
 
-			Consistently(errChan).ShouldNot(Receive())
-			queue.CloseWithError(errors.New("test error"))
-			Eventually(errChan).Should(Receive(MatchError("test error")))
-		})
-	})
-})
+	// unblock when the context is canceled
+	ctx, cancel := context.WithCancel(context.Background())
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := queue.Receive(ctx)
+		errChan <- err
+	}()
+	select {
+	case <-errChan:
+		t.Fatal("expected to not receive error")
+	case <-time.After(scaleDuration(10 * time.Millisecond)):
+	}
+	cancel()
+	select {
+	case err := <-errChan:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestDatagramQueueClose(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+
+	for i := 0; i < maxDatagramSendQueueLen; i++ {
+		require.NoError(t, queue.Add(&wire.DatagramFrame{Data: []byte{0}}))
+	}
+	errChan1 := make(chan error, 1)
+	go func() { errChan1 <- queue.Add(&wire.DatagramFrame{Data: []byte("foobar")}) }()
+	errChan2 := make(chan error, 1)
+	go func() {
+		_, err := queue.Receive(context.Background())
+		errChan2 <- err
+	}()
+
+	queue.CloseWithError(errors.New("test error"))
+
+	select {
+	case err := <-errChan1:
+		require.EqualError(t, err, "test error")
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	select {
+	case err := <-errChan2:
+		require.EqualError(t, err, "test error")
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}

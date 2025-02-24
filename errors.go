@@ -3,7 +3,7 @@ package quic
 import (
 	"fmt"
 
-	"github.com/lucas-clemente/quic-go/internal/qerr"
+	"github.com/quic-go/quic-go/internal/qerr"
 )
 
 type (
@@ -46,13 +46,30 @@ const (
 type StreamError struct {
 	StreamID  StreamID
 	ErrorCode StreamErrorCode
+	Remote    bool
 }
 
 func (e *StreamError) Is(target error) bool {
-	_, ok := target.(*StreamError)
-	return ok
+	t, ok := target.(*StreamError)
+	return ok && e.StreamID == t.StreamID && e.ErrorCode == t.ErrorCode && e.Remote == t.Remote
 }
 
 func (e *StreamError) Error() string {
-	return fmt.Sprintf("stream %d canceled with error code %d", e.StreamID, e.ErrorCode)
+	pers := "local"
+	if e.Remote {
+		pers = "remote"
+	}
+	return fmt.Sprintf("stream %d canceled by %s with error code %d", e.StreamID, pers, e.ErrorCode)
 }
+
+// DatagramTooLargeError is returned from Connection.SendDatagram if the payload is too large to be sent.
+type DatagramTooLargeError struct {
+	MaxDatagramPayloadSize int64
+}
+
+func (e *DatagramTooLargeError) Is(target error) bool {
+	t, ok := target.(*DatagramTooLargeError)
+	return ok && e.MaxDatagramPayloadSize == t.MaxDatagramPayloadSize
+}
+
+func (e *DatagramTooLargeError) Error() string { return "DATAGRAM frame too large" }

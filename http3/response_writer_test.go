@@ -4,15 +4,14 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"time"
 
-	mockquic "github.com/lucas-clemente/quic-go/internal/mocks/quic"
-	"github.com/lucas-clemente/quic-go/internal/utils"
+	"github.com/quic-go/qpack"
+	mockquic "github.com/quic-go/quic-go/internal/mocks/quic"
 
-	"github.com/golang/mock/gomock"
-	"github.com/marten-seemann/qpack"
-
-	. "github.com/onsi/ginkgo"
+	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"go.uber.org/mock/gomock"
 )
 
 var _ = Describe("Response Writer", func() {
@@ -25,15 +24,19 @@ var _ = Describe("Response Writer", func() {
 		strBuf = &bytes.Buffer{}
 		str := mockquic.NewMockStream(mockCtrl)
 		str.EXPECT().Write(gomock.Any()).DoAndReturn(strBuf.Write).AnyTimes()
-		rw = newResponseWriter(str, utils.DefaultLogger)
+		str.EXPECT().SetReadDeadline(gomock.Any()).Return(nil).AnyTimes()
+		str.EXPECT().SetWriteDeadline(gomock.Any()).Return(nil).AnyTimes()
+		rw = newResponseWriter(newStream(str, nil, nil, func(r io.Reader, u uint64) error { return nil }), nil, false, nil)
 	})
 
 	decodeHeader := func(str io.Reader) map[string][]string {
 		rw.Flush()
+		rw.flushTrailers()
 		fields := make(map[string][]string)
 		decoder := qpack.NewDecoder(nil)
 
-		frame, err := parseNextFrame(str)
+		fp := frameParser{r: str}
+		frame, err := fp.ParseNext()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(frame).To(BeAssignableToTypeOf(&headersFrame{}))
 		headersFrame := frame.(*headersFrame)
@@ -49,7 +52,8 @@ var _ = Describe("Response Writer", func() {
 	}
 
 	getData := func(str io.Reader) []byte {
-		frame, err := parseNextFrame(str)
+		fp := frameParser{r: str}
+		frame, err := fp.ParseNext()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(frame).To(BeAssignableToTypeOf(&dataFrame{}))
 		df := frame.(*dataFrame)
@@ -62,8 +66,9 @@ var _ = Describe("Response Writer", func() {
 	It("writes status", func() {
 		rw.WriteHeader(http.StatusTeapot)
 		fields := decodeHeader(strBuf)
-		Expect(fields).To(HaveLen(1))
+		Expect(fields).To(HaveLen(2))
 		Expect(fields).To(HaveKeyWithValue(":status", []string{"418"}))
+		Expect(fields).To(HaveKey("date"))
 	})
 
 	It("writes headers", func() {
@@ -110,11 +115,12 @@ var _ = Describe("Response Writer", func() {
 	})
 
 	It("does not WriteHeader() twice", func() {
-		rw.WriteHeader(200)
-		rw.WriteHeader(500)
+		rw.WriteHeader(http.StatusOK)
+		rw.WriteHeader(http.StatusInternalServerError)
 		fields := decodeHeader(strBuf)
-		Expect(fields).To(HaveLen(1))
+		Expect(fields).To(HaveLen(2))
 		Expect(fields).To(HaveKeyWithValue(":status", []string{"200"}))
+		Expect(fields).To(HaveKey("date"))
 	})
 
 	It("allows calling WriteHeader() several times when using the 103 status code", func() {
@@ -134,8 +140,10 @@ var _ = Describe("Response Writer", func() {
 
 		// According to the spec, headers sent in the informational response must also be included in the final response
 		fields = decodeHeader(strBuf)
-		Expect(fields).To(HaveLen(2))
+		Expect(fields).To(HaveLen(4))
 		Expect(fields).To(HaveKeyWithValue(":status", []string{"200"}))
+		Expect(fields).To(HaveKey("date"))
+		Expect(fields).To(HaveKey("content-type"))
 		Expect(fields).To(HaveKeyWithValue("link", []string{"</style.css>; rel=preload; as=style", "</script.js>; rel=preload; as=script"}))
 
 		Expect(getData(strBuf)).To(Equal([]byte("foobar")))
@@ -146,5 +154,96 @@ var _ = Describe("Response Writer", func() {
 		n, err := rw.Write([]byte("foobar"))
 		Expect(n).To(BeZero())
 		Expect(err).To(MatchError(http.ErrBodyNotAllowed))
+	})
+
+	It("first call to Write sniffs if Content-Type is not set", func() {
+		n, err := rw.Write([]byte("<html></html>"))
+		Expect(n).To(Equal(13))
+		Expect(err).ToNot(HaveOccurred())
+
+		fields := decodeHeader(strBuf)
+		Expect(fields).To(HaveKeyWithValue("content-type", []string{"text/html; charset=utf-8"}))
+	})
+
+	It(`is compatible with "net/http".ResponseController`, func() {
+		Expect(rw.SetReadDeadline(time.Now().Add(1 * time.Second))).To(BeNil())
+		Expect(rw.SetWriteDeadline(time.Now().Add(1 * time.Second))).To(BeNil())
+	})
+
+	It(`checks Content-Length header`, func() {
+		rw.Header().Set("Content-Length", "6")
+		n, err := rw.Write([]byte("foobar"))
+		Expect(n).To(Equal(6))
+		Expect(err).To(BeNil())
+
+		n, err = rw.Write([]byte("foobar"))
+		Expect(n).To(Equal(0))
+		Expect(err).To(Equal(http.ErrContentLength))
+	})
+
+	It(`panics when writing invalid status`, func() {
+		Expect(func() { rw.WriteHeader(99) }).To(Panic())
+		Expect(func() { rw.WriteHeader(1000) }).To(Panic())
+	})
+
+	It("write announced trailer", func() {
+		rw.Header().Add("Trailer", "Key")
+		rw.WriteHeader(http.StatusTeapot)
+		n, err := rw.Write([]byte("foobar"))
+		Expect(n).To(Equal(6))
+		Expect(err).ToNot(HaveOccurred())
+		rw.Header().Set("Key", "Value")
+
+		// writeTrailers needs to be called after writing the full body
+		Expect(rw.writeTrailers()).ToNot(HaveOccurred())
+
+		fields := decodeHeader(strBuf)
+		Expect(fields).To(HaveKeyWithValue(":status", []string{"418"}))
+		Expect(fields).To(HaveKeyWithValue("trailer", []string{"Key"}))
+		Expect(getData(strBuf)).To(Equal([]byte("foobar")))
+
+		fields = decodeHeader(strBuf)
+		Expect(fields).To(HaveKeyWithValue("key", []string{"Value"}))
+	})
+
+	It("ignore non-announced trailer (without trailer prefix)", func() {
+		rw.Header().Set("Trailer", "Key")
+		rw.WriteHeader(200)
+		rw.Write([]byte("foobar"))
+		rw.Header().Set("UnknownKey", "Value")
+		rw.Header().Set("Key", "Value")
+
+		// Needs to call writeTrailers to simulate the end of the handler
+		Expect(rw.writeTrailers()).ToNot(HaveOccurred())
+		headers := decodeHeader(strBuf)
+		Expect(headers).To(HaveKeyWithValue(":status", []string{"200"}))
+		Expect(headers).To(HaveKeyWithValue("trailer", []string{"Key"}))
+
+		Expect(getData(strBuf)).To(Equal([]byte("foobar")))
+
+		trailers := decodeHeader(strBuf)
+		Expect(trailers).To(HaveKeyWithValue("key", []string{"Value"}))
+		Expect(trailers).To(Not(HaveKeyWithValue("unknownkey", []string{"Value"})))
+	})
+
+	It("write non-announced trailer (with trailer prefix)", func() {
+		rw.Header().Set("Trailer", "Key")
+		rw.WriteHeader(200)
+		rw.Write([]byte("foobar"))
+		rw.Header().Set("Key", "Value")
+		rw.Header().Set(http.TrailerPrefix+"Key2", "Value")
+		rw.Flush()
+
+		// Needs to call writeTrailers to simulate the end of the handler
+		Expect(rw.writeTrailers()).ToNot(HaveOccurred())
+		headers := decodeHeader(strBuf)
+		Expect(headers).To(HaveKeyWithValue(":status", []string{"200"}))
+		Expect(headers).To(HaveKeyWithValue("trailer", []string{"Key"}))
+
+		Expect(getData(strBuf)).To(Equal([]byte("foobar")))
+
+		trailers := decodeHeader(strBuf)
+		Expect(trailers).To(HaveKeyWithValue("key", []string{"Value"}))
+		Expect(trailers).To(HaveKeyWithValue("key2", []string{"Value"}))
 	})
 })

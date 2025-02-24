@@ -3,8 +3,8 @@ package qlog
 import (
 	"fmt"
 
-	"github.com/lucas-clemente/quic-go/internal/wire"
-	"github.com/lucas-clemente/quic-go/logging"
+	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/logging"
 
 	"github.com/francoispqt/gojay"
 )
@@ -182,7 +182,7 @@ func marshalNewConnectionIDFrame(enc *gojay.Encoder, f *logging.NewConnectionIDF
 	enc.Int64Key("sequence_number", int64(f.SequenceNumber))
 	enc.Int64Key("retire_prior_to", int64(f.RetirePriorTo))
 	enc.IntKey("length", f.ConnectionID.Len())
-	enc.StringKey("connection_id", connectionID(f.ConnectionID).String())
+	enc.StringKey("connection_id", f.ConnectionID.String())
 	enc.StringKey("stateless_reset_token", fmt.Sprintf("%x", f.StatelessResetToken))
 }
 

@@ -6,139 +6,103 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	mrand "math/rand"
-	"net"
+	"sync"
+	"testing"
 	"time"
 
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/internal/protocol"
-	"github.com/lucas-clemente/quic-go/internal/utils"
-	"github.com/lucas-clemente/quic-go/logging"
-	"github.com/lucas-clemente/quic-go/qlog"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/logging"
+	"github.com/quic-go/quic-go/metrics"
+	"github.com/quic-go/quic-go/qlog"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/stretchr/testify/require"
 )
 
-type customTracer struct{}
-
-var _ logging.Tracer = &customTracer{}
-
-func (t *customTracer) TracerForConnection(context.Context, logging.Perspective, logging.ConnectionID) logging.ConnectionTracer {
-	return &customConnTracer{}
-}
-func (t *customTracer) SentPacket(net.Addr, *logging.Header, logging.ByteCount, []logging.Frame) {}
-func (t *customTracer) DroppedPacket(net.Addr, logging.PacketType, logging.ByteCount, logging.PacketDropReason) {
-}
-
-type customConnTracer struct{}
-
-var _ logging.ConnectionTracer = &customConnTracer{}
-
-func (t *customConnTracer) StartedConnection(local, remote net.Addr, srcConnID, destConnID logging.ConnectionID) {
-}
-
-func (t *customConnTracer) NegotiatedVersion(chosen logging.VersionNumber, clientVersions, serverVersions []logging.VersionNumber) {
-}
-func (t *customConnTracer) ClosedConnection(error)                                   {}
-func (t *customConnTracer) SentTransportParameters(*logging.TransportParameters)     {}
-func (t *customConnTracer) ReceivedTransportParameters(*logging.TransportParameters) {}
-func (t *customConnTracer) RestoredTransportParameters(*logging.TransportParameters) {}
-func (t *customConnTracer) SentPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, ack *logging.AckFrame, frames []logging.Frame) {
-}
-
-func (t *customConnTracer) ReceivedVersionNegotiationPacket(*logging.Header, []logging.VersionNumber) {
-}
-func (t *customConnTracer) ReceivedRetry(*logging.Header) {}
-func (t *customConnTracer) ReceivedPacket(hdr *logging.ExtendedHeader, size logging.ByteCount, frames []logging.Frame) {
-}
-func (t *customConnTracer) BufferedPacket(logging.PacketType) {}
-func (t *customConnTracer) DroppedPacket(logging.PacketType, logging.ByteCount, logging.PacketDropReason) {
-}
-
-func (t *customConnTracer) UpdatedMetrics(rttStats *logging.RTTStats, cwnd, bytesInFlight logging.ByteCount, packetsInFlight int) {
-}
-
-func (t *customConnTracer) AcknowledgedPacket(logging.EncryptionLevel, logging.PacketNumber) {}
-func (t *customConnTracer) LostPacket(logging.EncryptionLevel, logging.PacketNumber, logging.PacketLossReason) {
-}
-func (t *customConnTracer) UpdatedCongestionState(logging.CongestionState)                     {}
-func (t *customConnTracer) UpdatedPTOCount(value uint32)                                       {}
-func (t *customConnTracer) UpdatedKeyFromTLS(logging.EncryptionLevel, logging.Perspective)     {}
-func (t *customConnTracer) UpdatedKey(generation logging.KeyPhase, remote bool)                {}
-func (t *customConnTracer) DroppedEncryptionLevel(logging.EncryptionLevel)                     {}
-func (t *customConnTracer) DroppedKey(logging.KeyPhase)                                        {}
-func (t *customConnTracer) SetLossTimer(logging.TimerType, logging.EncryptionLevel, time.Time) {}
-func (t *customConnTracer) LossTimerExpired(logging.TimerType, logging.EncryptionLevel)        {}
-func (t *customConnTracer) LossTimerCanceled()                                                 {}
-func (t *customConnTracer) Debug(string, string)                                               {}
-func (t *customConnTracer) Close()                                                             {}
-
-var _ = Describe("Handshake tests", func() {
+func TestTracerHandshake(t *testing.T) {
 	addTracers := func(pers protocol.Perspective, conf *quic.Config) *quic.Config {
-		enableQlog := mrand.Int()%3 != 0
-		enableCustomTracer := mrand.Int()%3 != 0
+		enableQlog := mrand.Int()%2 != 0
+		enableMetrics := mrand.Int()%2 != 0
+		enableCustomTracer := mrand.Int()%2 != 0
 
-		fmt.Fprintf(GinkgoWriter, "%s using qlog: %t, custom: %t\n", pers, enableQlog, enableCustomTracer)
+		t.Logf("%s using qlog: %t, metrics: %t, custom: %t", pers, enableQlog, enableMetrics, enableCustomTracer)
 
-		var tracers []logging.Tracer
+		var tracerConstructors []func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer
 		if enableQlog {
-			tracers = append(tracers, qlog.NewTracer(func(p logging.Perspective, connectionID []byte) io.WriteCloser {
+			tracerConstructors = append(tracerConstructors, func(_ context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
 				if mrand.Int()%2 == 0 { // simulate that a qlog collector might only want to log some connections
-					fmt.Fprintf(GinkgoWriter, "%s qlog tracer deciding to not trace connection %x\n", p, connectionID)
+					t.Logf("%s qlog tracer deciding to not trace connection %s", p, connID)
 					return nil
 				}
-				fmt.Fprintf(GinkgoWriter, "%s qlog tracing connection %x\n", p, connectionID)
-				return utils.NewBufferedWriteCloser(bufio.NewWriter(&bytes.Buffer{}), ioutil.NopCloser(nil))
-			}))
+				t.Logf("%s qlog tracing connection %s", p, connID)
+				return qlog.NewConnectionTracer(utils.NewBufferedWriteCloser(bufio.NewWriter(&bytes.Buffer{}), io.NopCloser(nil)), p, connID)
+			})
+		}
+		if enableMetrics {
+			tracerConstructors = append(tracerConstructors, metrics.DefaultConnectionTracer)
 		}
 		if enableCustomTracer {
-			tracers = append(tracers, &customTracer{})
+			tracerConstructors = append(tracerConstructors, func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
+				return &logging.ConnectionTracer{}
+			})
 		}
 		c := conf.Clone()
-		c.Tracer = logging.NewMultiplexedTracer(tracers...)
+		c.Tracer = func(ctx context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
+			tracers := make([]*logging.ConnectionTracer, 0, len(tracerConstructors))
+			for _, c := range tracerConstructors {
+				if tr := c(ctx, p, connID); tr != nil {
+					tracers = append(tracers, tr)
+				}
+			}
+			return logging.NewMultiplexedConnectionTracer(tracers...)
+		}
 		return c
 	}
 
 	for i := 0; i < 3; i++ {
-		It("handshakes with a random combination of tracers", func() {
+		t.Run(fmt.Sprintf("run %d", i+1), func(t *testing.T) {
 			if enableQlog {
-				Skip("This test sets tracers and won't produce any qlogs.")
+				t.Skip("This test sets tracers and won't produce any qlogs.")
 			}
+
 			quicClientConf := addTracers(protocol.PerspectiveClient, getQuicConfig(nil))
 			quicServerConf := addTracers(protocol.PerspectiveServer, getQuicConfig(nil))
 
-			serverChan := make(chan quic.Listener)
-			go func() {
-				defer GinkgoRecover()
-				ln, err := quic.ListenAddr("localhost:0", getTLSConfig(), quicServerConf)
-				Expect(err).ToNot(HaveOccurred())
-				serverChan <- ln
-				sess, err := ln.Accept(context.Background())
-				Expect(err).ToNot(HaveOccurred())
-				str, err := sess.OpenUniStream()
-				Expect(err).ToNot(HaveOccurred())
-				_, err = str.Write(PRData)
-				Expect(err).ToNot(HaveOccurred())
-				Expect(str.Close()).To(Succeed())
-			}()
+			ln, err := quic.Listen(newUDPConnLocalhost(t), getTLSConfig(), quicServerConf)
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, ln.Close()) })
 
-			ln := <-serverChan
-			defer ln.Close()
+			var wg sync.WaitGroup
+			for j := 0; j < 3; j++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+					defer cancel()
+					conn, err := quic.Dial(ctx, newUDPConnLocalhost(t), ln.Addr(), getTLSClientConfig(), quicClientConf)
+					require.NoError(t, err)
+					defer conn.CloseWithError(0, "")
 
-			sess, err := quic.DialAddr(
-				fmt.Sprintf("localhost:%d", ln.Addr().(*net.UDPAddr).Port),
-				getTLSClientConfig(),
-				quicClientConf,
-			)
-			Expect(err).ToNot(HaveOccurred())
-			defer sess.CloseWithError(0, "")
-			str, err := sess.AcceptUniStream(context.Background())
-			Expect(err).ToNot(HaveOccurred())
-			data, err := io.ReadAll(str)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(data).To(Equal(PRData))
+					sconn, err := ln.Accept(ctx)
+					if err != nil {
+						return
+					}
+					sstr, err := sconn.OpenUniStream()
+					require.NoError(t, err)
+					_, err = sstr.Write(PRData)
+					require.NoError(t, err)
+					require.NoError(t, sstr.Close())
+
+					str, err := conn.AcceptUniStream(ctx)
+					require.NoError(t, err)
+					data, err := io.ReadAll(str)
+					require.NoError(t, err)
+					require.Equal(t, PRData, data)
+				}()
+			}
+			wg.Wait()
 		})
 	}
-})
+}
